@@ -169,3 +169,40 @@ def test_semantic_tool_schema_requires_python_function_field_names():
     assert "contract_path" in fn_schema["properties"]
     assert "function_name" in fn_schema["properties"]
     assert fn_schema["additionalProperties"] is False
+
+@pytest.mark.asyncio
+async def test_extract_semantics_retries_chunk_after_invalid_tool_call(tmp_path):
+    project = ProjectData(
+        name="p",
+        root_dir=tmp_path,
+        source_files=[SourceFile(path="src/Vault.sol", content="contract Vault { function withdraw() external {} }")],
+    )
+    llm = MockLLMClient([
+        [
+            {"tool": "report_semantic", "args": {"name": "Bad", "category": "Lending", "definition": "d", "description": "d", "functions": []}},
+            {"tool": "finish", "args": {}},
+        ],
+        [
+            {"tool": "report_semantic", "args": {"name": "Withdrawal Accounting", "category": "Lending", "definition": "d", "description": "d", "functions": [{"contract_path": "src/Vault.sol", "function_name": "withdraw"}]}},
+            {"tool": "finish", "args": {}},
+        ],
+    ])
+    out = await extract_semantics(llm, project, ["Lending"])
+    assert len(out) == 1
+    assert out[0].name == "Withdrawal Accounting"
+    assert len(llm.prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_semantics_fails_after_retry_exhausted(tmp_path):
+    project = ProjectData(
+        name="p",
+        root_dir=tmp_path,
+        source_files=[SourceFile(path="src/Vault.sol", content="contract Vault { function withdraw() external {} }")],
+    )
+    bad = [
+        {"tool": "report_semantic", "args": {"name": "Bad", "category": "Lending", "definition": "d", "description": "d", "functions": []}},
+        {"tool": "finish", "args": {}},
+    ]
+    with pytest.raises(RuntimeError, match="invalid semantics"):
+        await extract_semantics(MockLLMClient([bad, bad]), project, ["Lending"])

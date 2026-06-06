@@ -191,3 +191,30 @@ async def test_merge_findings_ignores_out_of_range_index_for_ambiguous_titles():
     )
     assert results[0].decision.target_ids == []
     assert results[1].decision.target_ids == []
+
+@pytest.mark.asyncio
+async def test_extract_findings_retries_chunk_after_invalid_tool_call(tmp_path):
+    llm = MockLLMClient([
+        [
+            {"tool": "report_finding", "args": finding_args(patterns="")},
+            {"tool": "finish", "args": {}},
+        ],
+        [
+            {"tool": "report_finding", "args": finding_args()},
+            {"tool": "finish", "args": {}},
+        ],
+    ])
+    out = await extract_findings(llm, project_with_report(tmp_path), ["Lending"])
+    assert len(out) == 1
+    assert out[0].title == "Reentrant withdraw"
+    assert len(llm.prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_findings_fails_after_retry_exhausted(tmp_path):
+    bad = [
+        {"tool": "report_finding", "args": finding_args(patterns="")},
+        {"tool": "finish", "args": {}},
+    ]
+    with pytest.raises(RuntimeError, match="invalid findings"):
+        await extract_findings(MockLLMClient([bad, bad]), project_with_report(tmp_path), ["Lending"])

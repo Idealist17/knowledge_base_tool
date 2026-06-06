@@ -175,33 +175,54 @@ class FindingAgentBuffer:
         return f"ok: finished{f' - {summary}' if summary else ''}"
 
 
+AGENTIC_CHUNK_ATTEMPTS = 2
+
+
+def _agentic_error(prefix: str, buffer) -> RuntimeError:
+    if getattr(buffer, "errors", None):
+        return RuntimeError(prefix + ": " + "; ".join(buffer.errors))
+    if not getattr(buffer, "finished", False):
+        return RuntimeError(prefix + ": agent stopped before calling finish")
+    return RuntimeError(prefix)
+
+
 async def extract_semantics(llm: LLMClient, project: ProjectData, categories: list, token_budget: int = 24000, model: str = "gpt-5.4-mini") -> list[ExtractedSemantic]:
     text = prompts.render_sources(project)
     out: list[ExtractedSemantic] = []
     category_values = [c.value if hasattr(c, 'value') else str(c) for c in categories]
     for chunk in chunk_text(text, token_budget, model):
-        buffer = SemanticAgentBuffer(set(category_values))
-        try:
-            await llm.agent(
-                system_prompt=prompts.semantic_extract_system_prompt(),
-                user_prompt=prompts.semantic_extract_prompt(project, chunk, category_values),
-                tools=prompts.semantic_tools_schema(),
-                tool_handlers={
-                    "report_semantic": buffer.report_semantic,
-                    "finish": buffer.finish,
-                },
-                schema_name="semantic_extract",
-                stop_condition=lambda: buffer.finished,
-            )
-        except RuntimeError as exc:
-            if buffer.errors:
-                raise RuntimeError("semantic extraction agent reported invalid semantics: " + "; ".join(buffer.errors)) from exc
-            raise
-        if buffer.errors:
-            raise RuntimeError("semantic extraction agent reported invalid semantics: " + "; ".join(buffer.errors))
-        if not buffer.finished:
-            raise RuntimeError("semantic extraction agent stopped before calling finish")
-        out.extend(buffer.items)
+        last_error: RuntimeError | None = None
+        for _attempt in range(1, AGENTIC_CHUNK_ATTEMPTS + 1):
+            buffer = SemanticAgentBuffer(set(category_values))
+            try:
+                await llm.agent(
+                    system_prompt=prompts.semantic_extract_system_prompt(),
+                    user_prompt=prompts.semantic_extract_prompt(project, chunk, category_values),
+                    tools=prompts.semantic_tools_schema(),
+                    tool_handlers={
+                        "report_semantic": buffer.report_semantic,
+                        "finish": buffer.finish,
+                    },
+                    schema_name="semantic_extract",
+                    stop_condition=lambda: buffer.finished,
+                )
+            except RuntimeError as exc:
+                if buffer.errors:
+                    last_error = _agentic_error("semantic extraction agent reported invalid semantics", buffer)
+                else:
+                    last_error = exc
+            else:
+                if buffer.errors:
+                    last_error = _agentic_error("semantic extraction agent reported invalid semantics", buffer)
+                elif not buffer.finished:
+                    if last_error is None:
+                        last_error = _agentic_error("semantic extraction agent reported invalid semantics", buffer)
+                else:
+                    out.extend(buffer.items)
+                    last_error = None
+                    break
+        if last_error is not None:
+            raise last_error
     return dedup_semantics(out)
 
 
@@ -211,26 +232,36 @@ async def extract_findings(llm: LLMClient, project: ProjectData, categories: lis
     out: list[ExtractedFinding] = []
     category_values = [c.value if hasattr(c, 'value') else str(c) for c in categories]
     for chunk in chunk_text(project.audit_report.render(), token_budget, model):
-        buffer = FindingAgentBuffer()
-        try:
-            await llm.agent(
-                system_prompt=prompts.finding_extract_system_prompt(),
-                user_prompt=prompts.finding_extract_prompt(project, chunk, category_values),
-                tools=prompts.finding_tools_schema(),
-                tool_handlers={
-                    "report_finding": buffer.report_finding,
-                    "finish": buffer.finish,
-                },
-                schema_name="finding_extract",
-                stop_condition=lambda: buffer.finished,
-            )
-        except RuntimeError as exc:
-            if buffer.errors:
-                raise RuntimeError("finding extraction agent reported invalid findings: " + "; ".join(buffer.errors)) from exc
-            raise
-        if buffer.errors:
-            raise RuntimeError("finding extraction agent reported invalid findings: " + "; ".join(buffer.errors))
-        if not buffer.finished:
-            raise RuntimeError("finding extraction agent stopped before calling finish")
-        out.extend(buffer.items)
+        last_error: RuntimeError | None = None
+        for _attempt in range(1, AGENTIC_CHUNK_ATTEMPTS + 1):
+            buffer = FindingAgentBuffer()
+            try:
+                await llm.agent(
+                    system_prompt=prompts.finding_extract_system_prompt(),
+                    user_prompt=prompts.finding_extract_prompt(project, chunk, category_values),
+                    tools=prompts.finding_tools_schema(),
+                    tool_handlers={
+                        "report_finding": buffer.report_finding,
+                        "finish": buffer.finish,
+                    },
+                    schema_name="finding_extract",
+                    stop_condition=lambda: buffer.finished,
+                )
+            except RuntimeError as exc:
+                if buffer.errors:
+                    last_error = _agentic_error("finding extraction agent reported invalid findings", buffer)
+                else:
+                    last_error = exc
+            else:
+                if buffer.errors:
+                    last_error = _agentic_error("finding extraction agent reported invalid findings", buffer)
+                elif not buffer.finished:
+                    if last_error is None:
+                        last_error = _agentic_error("finding extraction agent reported invalid findings", buffer)
+                else:
+                    out.extend(buffer.items)
+                    last_error = None
+                    break
+        if last_error is not None:
+            raise last_error
     return dedup_findings(out)
