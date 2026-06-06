@@ -136,18 +136,106 @@ def semantic_tools_schema() -> list[dict]:
     ]
 
 
-def finding_extract_prompt(project: ProjectData, chunk: str, categories: list[str]) -> str:
+def finding_extract_system_prompt() -> str:
     return (
-        "Extract audit findings by independent root cause. "
-        "Return exactly one JSON object with this shape: "
-        "{\"items\":[{\"title\":\"...\",\"severity\":\"High|Medium|Low|Informational\","
-        "\"category\":\"...\",\"subcategory\":\"...\",\"root_cause\":\"...\",\"description\":\"...\","
-        "\"patterns\":\"single string\",\"exploits\":\"single string\"}]}. "
-        "patterns and exploits must be strings, not arrays. "
-        "category/subcategory must be from the vulnerability taxonomy below. "
-        "Do not put the DeFi project category in finding.category; project categories are context only. "
-        f"Project categories for context only: {categories}\n\n{taxonomy_prompt()}\n\nREPORT:\n{chunk}"
+        "You are an expert DeFi knowledge engineer and senior smart contract security analyst. "
+        "Follow the user's instructions exactly. Extract vulnerability findings as project-agnostic, "
+        "reusable root-cause knowledge. When tools are available, record structured results only through tool calls."
     )
+
+
+def finding_extract_prompt(project: ProjectData, chunk: str, categories: list[str]) -> str:
+    return f"""You are reviewing one bounded audit report excerpt.
+Base extraction only on this excerpt; do not infer behaviour from outside context.
+Project-level domains are context only and must not be written into finding.category: {categories}
+
+## Vulnerability taxonomy
+
+{taxonomy_prompt()}
+
+## Report excerpt
+
+{chunk}
+
+## Extraction objective
+
+Extract audit findings by independent exploit mechanism or independent root cause. Do not answer with prose or raw JSON.
+Submit each finding through report_finding, then call finish once when the excerpt is fully handled.
+
+For every report_finding call, provide these Python-schema fields:
+1. title: preserve the original report finding title exactly as written. If one original finding is decomposed into multiple independent mechanisms, reuse the same title for each report_finding call.
+2. severity: one of exactly High, Medium, or Low. Map informational/non-security material to finish summary instead of report_finding unless it contains an exploitable mechanism that can be mapped to High/Medium/Low.
+3. category and subcategory: both must strictly come from the vulnerability taxonomy above. Do not use project domain categories here.
+4. root_cause: the specific technical or economic cause that makes the bug possible. Avoid abstract labels such as "access control issue", "accounting bug", or "validation missing" unless the concrete missing check, stale state, rounding direction, trust boundary, incentive mismatch, or failure propagation is also stated.
+5. description: explain the vulnerable state before the action, the state after the action, who can break the intended behaviour, and how the invariant or accounting relationship drifts.
+6. patterns: a single string describing reusable detection patterns: relevant state variables, required call ordering, external failure modes, and control-flow decisions.
+7. exploits: a single string describing a reproducible attack or failure sequence from setup to impact.
+
+## Style and normalization rules
+
+- Keep title unchanged, including protocol, contract, function, or asset names if they are present in the original title.
+- In root_cause, description, patterns, and exploits, do not include protocol names, contract names, function signatures, brand names, or branded asset names. Rewrite them into role-based generic terms such as lending market, vault, position manager, oracle feed, governance executor, reward token, collateral asset, swap router, bridge adapter, keeper, or liquidator.
+- Keep Python field names exactly as listed above. Do not introduce alternate or Rust-specific field names.
+- patterns and exploits must be strings, not arrays or objects.
+- Prefer concrete state-transition language over broad summaries. Capture state preconditions, state mutations, external calls and failure handling, permissions, ordering dependencies, and invariant drift when present in the report.
+- Atomic decomposition: if one original report finding contains multiple independent mechanisms, root causes, or exploit paths, call report_finding once per independent mechanism and share the same original title. Do not split purely by paragraph if the mechanism is the same.
+- If the excerpt contains no vulnerability finding that can be represented with the required fields, call finish without report_finding.
+
+## Required tool protocol
+
+- Submit each distinct finding with report_finding.
+- When the excerpt is fully handled, call finish once.
+- If there is nothing meaningful to report, call finish without report_finding.
+- Do not call any tool after finish.
+"""
+
+
+def finding_tools_schema() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "report_finding",
+                "description": "Record one project-agnostic vulnerability finding extracted from the current audit report excerpt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "severity": {"type": "string", "enum": ["High", "Medium", "Low"]},
+                        "category": {"type": "string"},
+                        "subcategory": {"type": "string"},
+                        "root_cause": {"type": "string"},
+                        "description": {"type": "string"},
+                        "patterns": {"type": "string"},
+                        "exploits": {"type": "string"},
+                    },
+                    "required": [
+                        "title",
+                        "severity",
+                        "category",
+                        "subcategory",
+                        "root_cause",
+                        "description",
+                        "patterns",
+                        "exploits",
+                    ],
+                    "additionalProperties": True,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finish",
+                "description": "Signal that finding extraction for this report excerpt is complete. Call exactly once after all report_finding calls.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"summary": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+            },
+        },
+    ]
 
 
 def in_project_link_prompt(semantics: list[ExtractedSemantic], findings: list[ExtractedFinding]) -> str:
@@ -159,7 +247,15 @@ def semantic_merge_prompt(new_semantics: list[ExtractedSemantic], canonicals: li
 
 
 def finding_merge_prompt(new_findings: list[ExtractedFinding], canonicals: list[dict]) -> str:
-    return "Decide whether each new finding is NEW or merges to target canonical ids. Support multiple targets. Return exactly one JSON object: {\"items\":[{\"new_finding_title\":\"...\",\"target_ids\":[1],\"appended_description\":\"...\",\"appended_patterns\":\"...\",\"appended_exploits\":\"...\",\"reason\":\"...\"}]}\nNEW:\n" + json.dumps([x.model_dump(mode='json') for x in new_findings], indent=2) + "\nCANONICALS:\n" + json.dumps(canonicals, indent=2)
+    indexed_findings = [dict({"index": idx}, **x.model_dump(mode='json')) for idx, x in enumerate(new_findings)]
+    return (
+        "Decide whether each new finding is NEW or merges to target canonical ids. "
+        "Support multiple targets. Findings may share the same title, so you MUST identify each decision by new_finding_index. "
+        "Return exactly one JSON object: "
+        "{\"items\":[{\"new_finding_index\":0,\"new_finding_title\":\"...\",\"target_ids\":[1],"
+        "\"appended_description\":\"...\",\"appended_patterns\":\"...\",\"appended_exploits\":\"...\",\"reason\":\"...\"}]}"
+        "\nNEW:\n" + json.dumps(indexed_findings, indent=2) + "\nCANONICALS:\n" + json.dumps(canonicals, indent=2)
+    )
 
 
 def global_link_prompt(findings: list[dict], semantics: list[dict]) -> str:

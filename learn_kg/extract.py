@@ -34,19 +34,23 @@ def dedup_semantics(items: list[ExtractedSemantic]) -> list[ExtractedSemantic]:
 
 def dedup_findings(items: list[ExtractedFinding]) -> list[ExtractedFinding]:
     severity_rank = {"Informational": 0, "Low": 1, "Medium": 2, "High": 3}
-    by_title: dict[str, ExtractedFinding] = {}
+    by_mechanism: dict[tuple[str, str], ExtractedFinding] = {}
+
+    def normalized_key_part(value: str) -> str:
+        return " ".join(value.lower().strip().split())
+
     for finding in items:
         finding.title = finding.title.strip()
         finding.root_cause = finding.root_cause.strip()
         finding.description = finding.description.strip()
         finding.patterns = finding.patterns.strip()
         finding.exploits = finding.exploits.strip()
-        key = finding.title.lower().strip()
-        if not key:
+        key = (normalized_key_part(finding.title), normalized_key_part(finding.root_cause))
+        if not key[0] or not key[1]:
             continue
-        existing = by_title.get(key)
+        existing = by_mechanism.get(key)
         if existing is None:
-            by_title[key] = finding
+            by_mechanism[key] = finding
             continue
         if severity_rank.get(str(finding.severity), 0) > severity_rank.get(str(existing.severity), 0):
             existing.severity = finding.severity
@@ -60,7 +64,7 @@ def dedup_findings(items: list[ExtractedFinding]) -> list[ExtractedFinding]:
             existing.patterns = finding.patterns
         if len(finding.exploits) > len(existing.exploits):
             existing.exploits = finding.exploits
-    return list(by_title.values())
+    return list(by_mechanism.values())
 
 
 async def categorize_project(llm: LLMClient, project: ProjectData) -> list:
@@ -127,6 +131,50 @@ class SemanticAgentBuffer:
         return f"ok: finished{f' - {summary}' if summary else ''}"
 
 
+class FindingAgentBuffer:
+    def __init__(self) -> None:
+        self.items: list[ExtractedFinding] = []
+        self.finished = False
+        self.errors: list[str] = []
+
+    def report_finding(self, args: dict) -> str:
+        if self.finished:
+            msg = "error: extraction is already finished; do not report more findings"
+            self.errors.append(msg)
+            return msg
+        try:
+            finding = ExtractedFinding.model_validate(args)
+        except Exception as exc:
+            msg = f"error: invalid finding payload: {exc}"
+            self.errors.append(msg)
+            return msg
+        for field in ("title", "root_cause", "description", "patterns", "exploits"):
+            if not str(getattr(finding, field)).strip():
+                msg = f"error: `{field}` must not be empty"
+                self.errors.append(msg)
+                return msg
+        if str(finding.severity) not in {"High", "Medium", "Low"}:
+            msg = "error: `severity` must be one of ['High', 'Medium', 'Low']"
+            self.errors.append(msg)
+            return msg
+        entry = resolve_taxonomy_entry(finding.category, finding.subcategory)
+        if entry is None:
+            msg = f"error: invalid taxonomy pair: {finding.category}/{finding.subcategory}"
+            self.errors.append(msg)
+            return msg
+        finding.category = entry.category
+        finding.subcategory = entry.subcategory
+        self.items.append(finding)
+        return "ok: finding recorded"
+
+    def finish(self, args: dict) -> str:
+        if self.errors:
+            return "error: cannot finish while previous report_finding calls are invalid; restart or retry this chunk"
+        self.finished = True
+        summary = args.get("summary") if isinstance(args, dict) else None
+        return f"ok: finished{f' - {summary}' if summary else ''}"
+
+
 async def extract_semantics(llm: LLMClient, project: ProjectData, categories: list, token_budget: int = 24000, model: str = "gpt-5.4-mini") -> list[ExtractedSemantic]:
     text = prompts.render_sources(project)
     out: list[ExtractedSemantic] = []
@@ -161,16 +209,28 @@ async def extract_findings(llm: LLMClient, project: ProjectData, categories: lis
     if not project.audit_report:
         return []
     out: list[ExtractedFinding] = []
+    category_values = [c.value if hasattr(c, 'value') else str(c) for c in categories]
     for chunk in chunk_text(project.audit_report.render(), token_budget, model):
-        raw = await llm.json(prompts.finding_extract_prompt(project, chunk, [c.value if hasattr(c,'value') else str(c) for c in categories]), schema_name="finding_extract")
-        raw = ensure_list(raw, "items", "findings")
-        for item in raw or []:
-            if not isinstance(item, dict):
-                continue
-            f = ExtractedFinding.model_validate(item)
-            entry = resolve_taxonomy_entry(f.category, f.subcategory)
-            if entry is None:
-                raise ValueError(f"Invalid taxonomy pair from LLM: {f.category}/{f.subcategory}")
-            f.category = entry.category; f.subcategory = entry.subcategory
-            out.append(f)
+        buffer = FindingAgentBuffer()
+        try:
+            await llm.agent(
+                system_prompt=prompts.finding_extract_system_prompt(),
+                user_prompt=prompts.finding_extract_prompt(project, chunk, category_values),
+                tools=prompts.finding_tools_schema(),
+                tool_handlers={
+                    "report_finding": buffer.report_finding,
+                    "finish": buffer.finish,
+                },
+                schema_name="finding_extract",
+                stop_condition=lambda: buffer.finished,
+            )
+        except RuntimeError as exc:
+            if buffer.errors:
+                raise RuntimeError("finding extraction agent reported invalid findings: " + "; ".join(buffer.errors)) from exc
+            raise
+        if buffer.errors:
+            raise RuntimeError("finding extraction agent reported invalid findings: " + "; ".join(buffer.errors))
+        if not buffer.finished:
+            raise RuntimeError("finding extraction agent stopped before calling finish")
+        out.extend(buffer.items)
     return dedup_findings(out)

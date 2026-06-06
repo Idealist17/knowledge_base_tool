@@ -174,15 +174,12 @@ def test_dedup_semantics_merges_duplicate_names():
     assert len(out[0].functions) == 2
 
 
-def test_dedup_findings_merges_duplicate_titles():
-    a = ExtractedFinding(title=" Bug ", severity="Low", category="Access Control", subcategory="Missing Input Validation", root_cause="r", description="d", patterns="p", exploits="e")
-    b = ExtractedFinding(title="bug", severity="High", category="Cryptographic", subcategory="Lack of Proper Signature Verification", root_cause="long root", description="longer description", patterns="long pattern", exploits="long exploit")
+def test_dedup_findings_keeps_same_title_different_mechanisms():
+    a = ExtractedFinding(title=" Bug ", severity="Low", category="Access Control", subcategory="Missing Input Validation", root_cause="missing caller check", description="d", patterns="p", exploits="e")
+    b = ExtractedFinding(title="bug", severity="High", category="Cryptographic", subcategory="Lack of Proper Signature Verification", root_cause="unchecked signature domain", description="longer description", patterns="long pattern", exploits="long exploit")
     out = dedup_findings([a, b])
-    assert len(out) == 1
-    assert out[0].title == "Bug"
-    assert out[0].severity == "High"
-    assert out[0].root_cause == "long root"
-    assert out[0].subcategory == "Lack of Proper Signature Verification"
+    assert len(out) == 2
+    assert {x.root_cause for x in out} == {"missing caller check", "unchecked signature domain"}
 
 
 def test_write_project_completed_upserts_existing_project_and_edges(tmp_path):

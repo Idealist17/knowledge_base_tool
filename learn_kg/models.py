@@ -140,6 +140,7 @@ class SemanticMergeDecision(BaseModel):
 
 class FindingMergeDecision(BaseModel):
     new_finding_title: str
+    new_finding_index: int | None = None
     target_ids: list[int] = Field(default_factory=list)
     appended_description: str | None = None
     appended_patterns: str | None = None
