@@ -1,4 +1,5 @@
 from __future__ import annotations
+import inspect
 import json
 import random
 import asyncio
@@ -11,6 +12,19 @@ import httpx
 
 class LLMClient:
     async def json(self, prompt: str, *, schema_name: str = "response") -> Any:
+        raise NotImplementedError
+
+    async def agent(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Callable[[dict[str, Any]], Any]],
+        schema_name: str = "agent",
+        max_turns: int = 16,
+        stop_condition: Callable[[], bool] | None = None,
+    ) -> Any:
         raise NotImplementedError
 
 
@@ -47,10 +61,7 @@ class OpenAILLMClient(LLMClient):
             ],
             "response_format": {"type": "json_object"},
         }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._headers()
         resp = await self._post_with_retries(schema_name, prompt, headers, payload)
 
         body = resp.json()
@@ -62,6 +73,91 @@ class OpenAILLMClient(LLMClient):
         if isinstance(data, dict) and "items" in data:
             return data["items"]
         return data
+
+    async def agent(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Callable[[dict[str, Any]], Any]],
+        schema_name: str = "agent",
+        max_turns: int = 16,
+        stop_condition: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        if max_turns <= 0:
+            raise ValueError("max_turns must be positive")
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        tool_events: list[dict[str, Any]] = []
+        headers = self._headers()
+
+        for turn in range(1, max_turns + 1):
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+            }
+            resp = await self._post_with_retries(schema_name, user_prompt, headers, payload)
+            body = resp.json()
+            message = body.get("choices", [{}])[0].get("message", {}) or {}
+            tool_calls = message.get("tool_calls") or []
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": message.get("content"),
+            }
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            messages.append(assistant_message)
+            if not tool_calls:
+                if stop_condition and stop_condition():
+                    return tool_events
+                raise RuntimeError(f"Agent {schema_name} returned no tool calls before finish on turn {turn}")
+
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name")
+                if not name or name not in tool_handlers:
+                    raise RuntimeError(f"Agent {schema_name} called unknown tool: {name!r}")
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"Agent {schema_name} tool {name} arguments are not valid JSON: {raw_args}") from exc
+                if not isinstance(args, dict):
+                    raise RuntimeError(f"Agent {schema_name} tool {name} arguments must be a JSON object")
+                tool_call_id = call.get("id")
+                if not tool_call_id:
+                    raise RuntimeError(f"Agent {schema_name} tool call for {name} is missing an id")
+                result = tool_handlers[name](args)
+                if inspect.isawaitable(result):
+                    result = await result
+                result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                tool_events.append({"tool": name, "args": args, "result": result_text})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_text,
+                })
+
+            if stop_condition and stop_condition():
+                if self.logger:
+                    self.logger(f"[dim]Agent finished[/dim] schema={schema_name} turns={turn} tool_calls={len(tool_events)}")
+                return tool_events
+
+        raise RuntimeError(f"Agent {schema_name} exceeded max_turns={max_turns} without finish")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
     async def _post_with_retries(self, schema_name: str, prompt: str, headers: dict[str, str], payload: dict[str, Any]) -> httpx.Response:
         last_error: str | None = None
@@ -119,3 +215,44 @@ class MockLLMClient(LLMClient):
         if self.responses:
             return self.responses.pop(0)
         return []
+
+    async def agent(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Callable[[dict[str, Any]], Any]],
+        schema_name: str = "agent",
+        max_turns: int = 16,
+        stop_condition: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.prompts.append(user_prompt)
+        if not self.responses:
+            return []
+        script = self.responses.pop(0)
+        if isinstance(script, dict):
+            script = [script]
+        if not isinstance(script, list):
+            raise RuntimeError(f"Mock agent response for {schema_name} must be a tool-call script list")
+
+        events: list[dict[str, Any]] = []
+        for idx, event in enumerate(script, start=1):
+            if idx > max_turns:
+                raise RuntimeError(f"Agent {schema_name} exceeded max_turns={max_turns} without finish")
+            if not isinstance(event, dict) or "tool" not in event:
+                raise RuntimeError(f"Mock agent event must be {{'tool': name, 'args': {{...}}}}, got {event!r}")
+            name = event["tool"]
+            if name not in tool_handlers:
+                raise RuntimeError(f"Agent {schema_name} called unknown tool: {name!r}")
+            args = event.get("args") or {}
+            if not isinstance(args, dict):
+                raise RuntimeError(f"Mock agent args for {name} must be a dict")
+            result = tool_handlers[name](args)
+            if inspect.isawaitable(result):
+                result = await result
+            result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            events.append({"tool": name, "args": args, "result": result_text})
+        if stop_condition and stop_condition():
+            return events
+        raise RuntimeError(f"Agent {schema_name} exceeded scripted tool calls without finish")

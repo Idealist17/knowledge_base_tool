@@ -81,16 +81,79 @@ async def categorize_project(llm: LLMClient, project: ProjectData) -> list:
     return deduped or [coerce_defi_category("Others")]
 
 
+class SemanticAgentBuffer:
+    def __init__(self, allowed_categories: set[str]) -> None:
+        self.allowed_categories = allowed_categories | {"Others"}
+        self.items: list[ExtractedSemantic] = []
+        self.finished = False
+        self.errors: list[str] = []
+
+    def report_semantic(self, args: dict) -> str:
+        if self.finished:
+            msg = "error: extraction is already finished; do not report more semantics"
+            self.errors.append(msg)
+            return msg
+        try:
+            semantic = ExtractedSemantic.model_validate(args)
+        except Exception as exc:
+            msg = f"error: invalid semantic payload: {exc}"
+            self.errors.append(msg)
+            return msg
+        if not semantic.name.strip():
+            msg = "error: `name` must not be empty"
+            self.errors.append(msg)
+            return msg
+        if str(semantic.category) not in self.allowed_categories:
+            msg = f"error: `category` must be one of {sorted(self.allowed_categories)}"
+            self.errors.append(msg)
+            return msg
+        if not semantic.functions:
+            msg = "error: `functions` must contain at least one source function"
+            self.errors.append(msg)
+            return msg
+        for fn in semantic.functions:
+            if not fn.contract_path.strip() or not fn.function_name.strip():
+                msg = "error: every function must include non-empty contract_path and function_name"
+                self.errors.append(msg)
+                return msg
+        self.items.append(semantic)
+        return "ok: semantic recorded"
+
+    def finish(self, args: dict) -> str:
+        if self.errors:
+            return "error: cannot finish while previous report_semantic calls are invalid; restart or retry this chunk"
+        self.finished = True
+        summary = args.get("summary") if isinstance(args, dict) else None
+        return f"ok: finished{f' - {summary}' if summary else ''}"
+
+
 async def extract_semantics(llm: LLMClient, project: ProjectData, categories: list, token_budget: int = 24000, model: str = "gpt-5.4-mini") -> list[ExtractedSemantic]:
     text = prompts.render_sources(project)
     out: list[ExtractedSemantic] = []
+    category_values = [c.value if hasattr(c, 'value') else str(c) for c in categories]
     for chunk in chunk_text(text, token_budget, model):
-        raw = await llm.json(prompts.semantic_extract_prompt(project, chunk, [c.value if hasattr(c,'value') else str(c) for c in categories]), schema_name="semantic_extract")
-        raw = ensure_list(raw, "items", "semantics")
-        for item in raw or []:
-            if not isinstance(item, dict):
-                continue
-            out.append(ExtractedSemantic.model_validate(item))
+        buffer = SemanticAgentBuffer(set(category_values))
+        try:
+            await llm.agent(
+                system_prompt=prompts.semantic_extract_system_prompt(),
+                user_prompt=prompts.semantic_extract_prompt(project, chunk, category_values),
+                tools=prompts.semantic_tools_schema(),
+                tool_handlers={
+                    "report_semantic": buffer.report_semantic,
+                    "finish": buffer.finish,
+                },
+                schema_name="semantic_extract",
+                stop_condition=lambda: buffer.finished,
+            )
+        except RuntimeError as exc:
+            if buffer.errors:
+                raise RuntimeError("semantic extraction agent reported invalid semantics: " + "; ".join(buffer.errors)) from exc
+            raise
+        if buffer.errors:
+            raise RuntimeError("semantic extraction agent reported invalid semantics: " + "; ".join(buffer.errors))
+        if not buffer.finished:
+            raise RuntimeError("semantic extraction agent stopped before calling finish")
+        out.extend(buffer.items)
     return dedup_semantics(out)
 
 

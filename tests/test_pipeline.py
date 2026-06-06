@@ -15,13 +15,13 @@ async def test_pipeline_two_projects_mock_merge(tmp_path):
     p2 = load_c4_project(Path("tests/fixtures/c4"), 2)
     responses = [
         ["Lending"],
-        [{"name":"ETH Withdrawal Accounting","category":"Lending","definition":"withdraw accounting","description":"external transfer and balance update","functions":[{"contract_path":"src/Vault.sol","function_name":"withdraw"}]}],
+        [{"tool":"report_semantic","args":{"name":"ETH Withdrawal Accounting","category":"Lending","definition":"withdraw accounting","description":"external transfer and balance update","functions":[{"contract_path":"src/Vault.sol","function_name":"withdraw"}]}},{"tool":"finish","args":{"summary":"done"}}],
         [{"title":"Reentrant withdraw","severity":"High","category":"Reentrancy","subcategory":"Reentrancy Vulnerability with ETH Transfer","root_cause":"external call before balance update","description":"desc","patterns":"call before state","exploits":"repeat withdraw"}],
         [{"semantic_index":0,"finding_index":0,"strength":"High","evidence":"withdraw reentrancy"}],
         [{"new_semantic_name":"ETH Withdrawal Accounting","target_ids":[],"reason":"new"}],
         [{"new_finding_title":"Reentrant withdraw","target_ids":[],"reason":"new"}],
         ["Lending"],
-        [{"name":"ETH Withdrawal Accounting","category":"Lending","definition":"withdraw accounting","description":"external transfer and share update","functions":[{"contract_path":"src/Pool.sol","function_name":"exit"}]}],
+        [{"tool":"report_semantic","args":{"name":"ETH Withdrawal Accounting","category":"Lending","definition":"withdraw accounting","description":"external transfer and share update","functions":[{"contract_path":"src/Pool.sol","function_name":"exit"}]}},{"tool":"finish","args":{"summary":"done"}}],
         [{"title":"Reentrant exit","severity":"High","category":"Reentrancy","subcategory":"Reentrancy Vulnerability with ETH Transfer","root_cause":"external call before share update","description":"desc","patterns":"call before state","exploits":"repeat exit"}],
         [{"semantic_index":0,"finding_index":0,"strength":"High","evidence":"exit reentrancy"}],
         [{"new_semantic_name":"ETH Withdrawal Accounting","target_ids":[1],"appended_description":"pool variant","reason":"same pattern"}],
