@@ -116,7 +116,7 @@ async def test_extract_semantics_rejects_invalid_report_even_if_finish_follows(t
 
 
 @pytest.mark.asyncio
-async def test_extract_semantics_rejects_category_outside_project_categories(tmp_path):
+async def test_extract_semantics_allows_category_outside_project_categories(tmp_path):
     project = ProjectData(
         name="p",
         root_dir=tmp_path,
@@ -126,8 +126,11 @@ async def test_extract_semantics_rejects_category_outside_project_categories(tmp
         {"tool": "report_semantic", "args": {"name": "S", "category": "Dexes", "definition": "d", "description": "d", "functions": [{"contract_path": "src/Vault.sol", "function_name": "withdraw"}]}},
         {"tool": "finish", "args": {}},
     ]])
-    with pytest.raises(RuntimeError, match="category"):
-        await extract_semantics(llm, project, ["Lending"])
+
+    out = await extract_semantics(llm, project, ["Lending"])
+
+    assert len(out) == 1
+    assert out[0].category == "Dexes"
 
 
 @pytest.mark.asyncio

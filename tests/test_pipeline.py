@@ -32,3 +32,25 @@ async def test_pipeline_two_projects_mock_merge(tmp_path):
         assert session.scalar(select(s.SemanticMerge.to_semantic_id).where(s.SemanticMerge.from_semantic_id == 2)) == 1
         assert session.scalar(select(s.FindingMerge.to_finding_id).where(s.FindingMerge.from_finding_id == 2)) == 1
         assert session.scalar(select(s.SemanticFindingLink.evidence).where(s.SemanticFindingLink.semantic_node_id == 2)) == "exit reentrancy"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_uses_extracted_semantic_categories_for_merge_candidates(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}"); db.init()
+    p1 = load_c4_project(Path("tests/fixtures/c4"), 1)
+    p2 = load_c4_project(Path("tests/fixtures/c4"), 2)
+    responses = [
+        ["Derivatives"],
+        [{"tool":"report_semantic","args":{"name":"Option Exercise Settlement","category":"Derivatives","definition":"d","description":"first option settlement","functions":[{"contract_path":"src/Vault.sol","function_name":"withdraw"}]}},{"tool":"finish","args":{}}],
+        [{"tool":"finish","args":{}}],
+        [{"new_semantic_name":"Option Exercise Settlement","target_ids":[],"reason":"new"}],
+        ["Services"],
+        [{"tool":"report_semantic","args":{"name":"Option Exercise Settlement","category":"Derivatives","definition":"d","description":"second option settlement","functions":[{"contract_path":"src/Pool.sol","function_name":"exit"}]}},{"tool":"finish","args":{}}],
+        [{"tool":"finish","args":{}}],
+        [{"new_semantic_name":"Option Exercise Settlement","target_ids":[1],"reason":"same derivative semantic"}],
+    ]
+
+    await learn_projects(db, MockLLMClient(responses), [p1, p2], concurrency=1)
+
+    with db.Session() as session:
+        assert session.scalar(select(s.SemanticMerge.to_semantic_id).where(s.SemanticMerge.from_semantic_id == 2)) == 1

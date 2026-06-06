@@ -9,6 +9,7 @@ from .extract import categorize_project, extract_semantics, extract_findings
 from .merge import merge_semantics, merge_findings
 from .link import in_project_link, global_link
 from .config import LLMConfig
+from .taxonomy import coerce_defi_category
 
 
 def _log(logger: Callable[[str], None] | None, message: str) -> None:
@@ -36,8 +37,9 @@ async def learn_project(db: HistoricalDatabase, llm: LLMClient, project: Project
     _log(logger, "  [cyan]stage[/cyan] in-project link")
     links = await in_project_link(llm, semantics, findings)
     _log(logger, f"  [green]done[/green] in-project link links={len(links)}")
-    canon_sem = db.canonical_semantics_with_children_for_categories([c.value for c in categories])
-    _log(logger, f"  [cyan]stage[/cyan] merge semantics new={len(semantics)} canon_candidates={len(canon_sem)}")
+    semantic_categories = sorted({coerce_defi_category(sem.category).value for sem in semantics})
+    canon_sem = db.canonical_semantics_with_children_for_categories(semantic_categories)
+    _log(logger, f"  [cyan]stage[/cyan] merge semantics new={len(semantics)} categories={semantic_categories} canon_candidates={len(canon_sem)}")
     sem_results = await merge_semantics(llm, semantics, canon_sem)
     canon_find = db.canonical_findings_with_children_for_categories([c.value for c in categories])
     sem_merge_count = sum(1 for r in sem_results if r.decision.target_ids)

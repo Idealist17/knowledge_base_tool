@@ -73,12 +73,39 @@ For every reported semantic, provide:
 4. functions: source anchors using the exact Python schema fields contract_path and function_name. This is the only place where file paths and real function identifiers belong. Provide at least one anchor.
 5. category: one category from the assigned project domains; choose "Others" only when the behaviour cannot be placed in those domains.
 
-## Style and grouping rules
+## Critical Rules
 
-- Keep name, definition, and description free of project branding, contract identifiers, function signatures, library API names, and token brand names. Replace them with role-based wording such as collateral vault, reward checkpoint, swap router, settlement adapter, receipt token, signer, keeper, or oracle feed. For example, rewrite a project-specific phrase like "deposit into a named vault to mint named shares" as "deposit into a shared vault to mint accounting shares".
-- Use normal DeFi vocabulary where it fits: liquidity provision, debt position, vault share, invariant-preserving swap, range order, reward index, liquidation, escrow settlement, signed intent, and similar terms.
-- Group by business meaning, not by syntax. Entry points that implement the same user-visible or accounting behaviour should be submitted together in one report_semantic call. Administrative setters, read-only helpers, governance plumbing, and ordinary token boilerplate should be folded into a single Utility/Admin item for the slice instead of many tiny items.
-- Cover all relevant callable/public entry points visible in the slice. Later pipeline stages will merge duplicate cross-chunk output, so do not omit a behaviour merely because it may appear elsewhere.
+1. Hard rule on abstraction: name, definition, and description MUST NOT include project-specific names. Use only generic DeFi roles. For example, rewrite project-specific phrasing into role-based phrasing.
+   - Bad: "Deposit into BentoBox to mint BentoShares".
+   - Good: "Deposit into shared vault to mint unified liquidity shares".
+2. Do not include specific protocol or project names in name, definition, or description.
+   - Bad: "Uniswap pool swap settlement".
+   - Good: "constant-product pool swap settlement".
+3. Do not include specific contract names in name, definition, or description; keep them only in functions.contract_path when needed for source anchoring.
+   - Bad: "UniswapV2Pair reserve update".
+   - Good: "pair reserve update".
+4. Do not include specific function signatures or library API names in name, definition, or description; keep the real entry point only in functions.function_name.
+   - Bad: "swapExactTokensForTokens(...) computes output before transfer".
+   - Good: "the swap entry point computes output before the inbound transfer".
+5. Do not include specific branded asset names in name, definition, or description.
+   - Bad: "accepts ETH and wraps it into WETH".
+   - Good: "accepts the native asset and wraps it into a wrapped native asset".
+   - Bad: "transfers USDC collateral".
+   - Good: "transfers stablecoin collateral".
+6. Use canonical DeFi vocabulary where it fits.
+   - Bad: "handles money moving stuff".
+   - Good: "escrow settlement", "liquidity provision", "debt position", "vault share", or "invariant-preserving swap".
+7. Group by business meaning, not by syntax. Submit same-meaning entry points together in one report_semantic call.
+   - Bad: separate semantics for mint, burn, _mint, and _burn when they are all token supply updates.
+   - Good: one "Fungible token supply adjustment" semantic with all related functions listed.
+8. Fold admin, read-only helpers, governance plumbing, and ordinary token boilerplate into one Utility/Admin item for the slice instead of many tiny items.
+   - Bad: one semantic for setFee, one for setBaseURI, one for domainSeparator.
+   - Good: one "Utility/Admin configuration and helpers" semantic.
+9. Cover all relevant callable/public entry points visible in this slice, even if another chunk may repeat them later.
+   - Bad: skipping a settlement entry point because a later chunk may include it again.
+   - Good: report it now and let cross-chunk merging deduplicate later.
+
+The functions field is the only place where real file paths and function identifiers belong. It SHOULD keep the exact Python schema fields contract_path and function_name.
 
 ## Required tool protocol
 
@@ -171,15 +198,42 @@ For every report_finding call, provide these Python-schema fields:
 6. patterns: a single string describing reusable detection patterns: relevant state variables, required call ordering, external failure modes, and control-flow decisions.
 7. exploits: a single string describing a reproducible attack or failure sequence from setup to impact.
 
-## Style and normalization rules
+## Critical Rules
 
-- Keep title unchanged, including protocol, contract, function, or asset names if they are present in the original title.
-- In root_cause, description, patterns, and exploits, do not include protocol names, contract names, function signatures, brand names, or branded asset names. Rewrite them into role-based generic terms such as lending market, vault, position manager, oracle feed, governance executor, reward token, collateral asset, swap router, bridge adapter, keeper, or liquidator.
-- Keep Python field names exactly as listed above. Do not introduce alternate or Rust-specific field names.
-- patterns and exploits must be strings, not arrays or objects.
-- Prefer concrete state-transition language over broad summaries. Capture state preconditions, state mutations, external calls and failure handling, permissions, ordering dependencies, and invariant drift when present in the report.
-- Atomic decomposition: if one original report finding contains multiple independent mechanisms, root causes, or exploit paths, call report_finding once per independent mechanism and share the same original title. Do not split purely by paragraph if the mechanism is the same.
-- If the excerpt contains no vulnerability finding that can be represented with the required fields, call finish without report_finding.
+0. Keep title unchanged, including protocol, contract, function, or asset names if they are present in the original title. The title is the only field where original report wording is preserved verbatim.
+   - Example: if the report title is "USDC withdrawals can lock VaultX", keep that exact title.
+1. Hard rule on abstraction: outside the title, root_cause, description, patterns, and exploits MUST NOT include project-specific names. Use only generic security and DeFi roles.
+   - Bad: "VaultX calls USDC.transferFrom in withdrawFromVault(...)".
+   - Good: "the vault calls an external token transfer in the withdrawal entry point".
+2. do not include protocol names or specific project names outside the title.
+   - Bad: "Aave market accounting drifts".
+   - Good: "lending market accounting drifts".
+3. Do not include specific contract names outside the title.
+   - Bad: "UniswapV2Pair updates reserves after the callback".
+   - Good: "the pair contract updates reserves after the external callback".
+4. Do not include specific function signatures or library API names outside the title.
+   - Bad: "swapExactTokensForTokens(...) lacks a stale-price guard".
+   - Good: "the swap entry point lacks a stale-price guard".
+5. Do not include specific branded asset names outside the title.
+   - Bad: "USDC transfer reverts and locks WETH collateral".
+   - Good: "stablecoin transfer reverts and locks wrapped native-asset collateral".
+   - Bad: "stETH share accounting is stale".
+   - Good: "wrapped staking receipt share accounting is stale".
+6. Keep Python field names exactly as listed above. Do not introduce alternate or Rust-specific field names.
+   - Bad: emit function_name/contract anchors or Rust-only field names in report_finding.
+   - Good: emit title, severity, category, subcategory, root_cause, description, patterns, and exploits.
+7. patterns and exploits must be strings, not arrays or objects.
+   - Bad: patterns: ["external call before state update"].
+   - Good: patterns: "external call occurs before state update".
+8. Prefer concrete state-transition language over broad summaries.
+   - Bad: "accounting bug due to missing validation".
+   - Good: "the debt index is read before interest accrual, so the repay path burns too few debt shares after the index increases".
+9. Atomic decomposition: if one original report finding contains multiple independent mechanisms, call report_finding once per mechanism and share the same original title.
+   - Bad: combine "missing owner check" and "zero-address setter bricks withdrawals" into one root cause.
+   - Good: emit two findings with the same title and separate root_cause, patterns, and exploits.
+10. Do not invent findings that are not supported by this excerpt; if no supported High/Medium/Low finding exists, call finish without report_finding.
+   - Bad: infer a reentrancy issue from a generic transfer mention.
+   - Good: report only when the excerpt shows the call ordering, state drift, or exploitable precondition.
 
 ## Required tool protocol
 

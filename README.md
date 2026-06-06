@@ -3,7 +3,11 @@
 This is a Python command-line tool for building a reusable smart-contract audit knowledge graph from local source code and audit notes. It extracts protocol semantics, vulnerability findings, and relationships between them, stores the result in SQLite, and can export the graph to DOT or an interactive HTML view.
 
 ```text
-Source code + audit material -> LLM extraction -> normalization -> merge -> linking -> SQLite KG -> DOT/HTML export
+Source code + audit material
+  -> category JSON calls
+  -> agentic semantic/finding extraction via tool calls
+  -> normalization + retry
+  -> merge -> linking -> SQLite KG -> DOT/HTML export
 ```
 
 The project is designed to be easy to run locally, simple to inspect, and structured around a clear data flow.
@@ -13,9 +17,10 @@ The project is designed to be easy to run locally, simple to inspect, and struct
 - Load explicit local projects with optional audit reports.
 - Load C4-style fixture directories with `contracts/`, `reports/`, or `audits/` folders.
 - Classify projects by DeFi category.
-- Extract project-level semantics from Solidity source chunks.
-- Extract audit findings and map them to a vulnerability taxonomy.
-- Deduplicate and merge similar semantics/findings into canonical graph nodes.
+- Extract project-level semantics from Solidity source chunks with agentic `report_semantic` / `finish` tool calls.
+- Extract audit findings with agentic `report_finding` / `finish` tool calls and map them to a vulnerability taxonomy.
+- Retry failed semantic/finding extraction chunks once with a fresh agent buffer before failing the chunk.
+- Deduplicate and merge similar semantics/findings into canonical graph nodes, including same-title findings with different root causes.
 - Link findings back to related protocol behavior.
 - Persist the knowledge graph in SQLite.
 - Export graph snapshots as DOT or browser-friendly HTML.
@@ -38,7 +43,7 @@ OPENAI_MODEL=your-model-name
 OPENAI_BASE_URL=https://your-openai-compatible-endpoint.example.com/v1
 ```
 
-`OPENAI_BASE_URL` is optional for the default OpenAI endpoint. For a relay or local gateway, the endpoint must support `POST /chat/completions` and JSON response mode.
+`OPENAI_BASE_URL` is optional for the default OpenAI endpoint. For a relay or local gateway, the endpoint must support `POST /chat/completions`, JSON response mode, and Chat Completions tool/function calls. Semantics and findings are submitted through tools; categories, merges, and links still use JSON responses.
 
 ## Quick start
 
@@ -127,12 +132,23 @@ datasets/c4-2024/
 
 1. Load source files and report material.
 2. Chunk long inputs by token budget.
-3. Ask the model for project categories, semantics, findings, and links.
-4. Normalize model output into typed Pydantic models.
-5. Merge duplicate or near-duplicate graph nodes.
-6. Write projects, categories, semantic nodes, findings, and links into SQLite.
-7. Optionally run global canonical semantic-to-finding linking.
-8. Export DOT/HTML graph views when needed.
+3. Classify the project into DeFi categories with JSON-mode model output.
+4. Extract source-code semantics with `report_semantic` tool calls and close each chunk with `finish`.
+5. Extract audit findings with `report_finding` tool calls and close each report chunk with `finish`.
+6. Retry a failed semantic/finding chunk once with a fresh buffer; failed attempts never write partial extracted items.
+7. Normalize tool arguments into typed Pydantic models and deduplicate within the project.
+8. Merge duplicate or near-duplicate graph nodes.
+9. Link findings back to same-project semantics, then write projects, categories, semantic nodes, findings, and links into SQLite.
+10. Optionally run global canonical semantic-to-finding linking and export DOT/HTML graph views.
+
+## Agentic extraction behavior
+
+Semantic and finding extraction are tool-call workflows rather than free-form JSON output:
+
+- `report_semantic` records one project-agnostic behavior with `name`, `category`, `definition`, `description`, and source `functions` using Python field names `contract_path` and `function_name`.
+- `report_finding` records one vulnerability mechanism with `title`, `severity`, `category`, `subcategory`, `root_cause`, `description`, `patterns`, and `exploits`.
+- `finish` is required once per chunk. If a model emits invalid tool arguments, the chunk is retried once from scratch with a new buffer. Partial results from failed attempts are discarded.
+- Finding extraction supports atomic decomposition: one original report title may produce multiple findings when the root causes are independently exploitable. Deduplication therefore uses title plus root cause, not title alone.
 
 ## SQLite graph model
 
@@ -148,10 +164,17 @@ The schema is still under construction but it is optimized for readability:
 ## Development
 
 ```bash
-pytest
+.venv/bin/pytest -q
 ```
 
-The test suite uses `MockLLMClient` for deterministic extraction, merge, and linking behavior.
+The test suite uses `MockLLMClient` for deterministic extraction, merge, and linking behavior. Agentic extraction tests model tool-call scripts such as:
+
+```python
+[
+    {"tool": "report_finding", "args": {"title": "...", "severity": "High", "category": "...", "subcategory": "...", "root_cause": "...", "description": "...", "patterns": "...", "exploits": "..."}},
+    {"tool": "finish", "args": {"summary": "done"}},
+]
+```
 
 ## Notes
 

@@ -107,10 +107,7 @@ class SemanticAgentBuffer:
             msg = "error: `name` must not be empty"
             self.errors.append(msg)
             return msg
-        if str(semantic.category) not in self.allowed_categories:
-            msg = f"error: `category` must be one of {sorted(self.allowed_categories)}"
-            self.errors.append(msg)
-            return msg
+        semantic.category = coerce_defi_category(semantic.category)
         if not semantic.functions:
             msg = "error: `functions` must contain at least one source function"
             self.errors.append(msg)
