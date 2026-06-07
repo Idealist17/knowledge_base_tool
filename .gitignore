@@ -26,11 +26,14 @@ dist/
 !.env.example
 
 # Local databases and generated graph exports
+db/
+outputs/
 *.sqlite
 *.sqlite3
 *.db
 kg.dot
 kg.html
+
 
 # Crawled/generated datasets
 out_train/

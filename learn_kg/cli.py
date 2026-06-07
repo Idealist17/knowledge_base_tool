@@ -6,6 +6,7 @@ from rich.console import Console
 from dotenv import load_dotenv
 
 from .db import HistoricalDatabase, init_db, describe_db_url
+from .db import sqlite_path_from_url
 from .project_loader import load_project, parse_reports
 from .c4_loader import select_contest_ids, load_c4_project
 from .models import ProjectSpec
@@ -14,6 +15,7 @@ from .config import LLMConfig
 from .pipeline import learn_projects as run_learn_projects
 from .link import global_link as run_global_link
 from .export import export_dot as do_export_dot, export_html as do_export_html, export_counts
+from .export_checklist import export_project_checklist
 
 load_dotenv()
 app = typer.Typer(help="Build and explore a local smart-contract audit knowledge graph")
@@ -102,6 +104,29 @@ def link_cmd(db: str = typer.Option(..., "--db"), concurrency: int = typer.Optio
         log(f"[bold]config[/bold] db={describe_db_url(db)} model={cfg.model} base_url={cfg.base_url or 'default'} retries={cfg.max_retries} timeout={cfg.request_timeout}s")
     edges = asyncio.run(run_global_link(make_llm(cfg, verbose=verbose), kg, logger=log))
     console.print(f"linked {len(edges)} edges")
+
+
+@app.command("checklist")
+def checklist_cmd(
+    db: str = typer.Option(..., "--db"),
+    project: str = typer.Option(..., "--project", help="Project spec in name:path[:platform_id] form."),
+    out: Path = typer.Option(..., "--out"),
+    input_token_budget: int = typer.Option(24000, "--input-token-budget"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Show detailed terminal progress logs."),
+):
+    """Export a read-only Markdown audit checklist for a new project."""
+    sqlite_path = sqlite_path_from_url(db)
+    if sqlite_path is not None and not sqlite_path.exists():
+        raise typer.BadParameter(f"SQLite database does not exist for read-only checklist export: {sqlite_path}", param_hint="--db")
+    kg = HistoricalDatabase(db)
+    cfg = LLMConfig(input_token_budget=input_token_budget)
+    log = make_logger(verbose)
+    spec = ProjectSpec.parse(project)
+    project_data = load_project(spec)
+    if log:
+        log(f"[bold]checklist[/bold] db={describe_db_url(db)} project={project_data.name} out={out} model={cfg.model}")
+    doc = asyncio.run(export_project_checklist(kg, make_llm(cfg, verbose=verbose), project_data, out, config=cfg, logger=log))
+    console.print(f"{out} project_semantics={doc.project_semantics_analyzed} historical_matches={doc.historical_semantics_matched} checklist_items={doc.checklist_items}")
 
 
 @app.command("list-projects")
