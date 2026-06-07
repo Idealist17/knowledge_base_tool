@@ -9,7 +9,7 @@ from .db import HistoricalDatabase, init_db, describe_db_url
 from .db import sqlite_path_from_url
 from .project_loader import load_project, parse_reports
 from .c4_loader import select_contest_ids, load_c4_project
-from .models import ProjectSpec
+from .models import LinkStrength, ProjectSpec
 from .llm_client import OpenAILLMClient
 from .config import LLMConfig
 from .pipeline import learn_projects as run_learn_projects
@@ -114,6 +114,13 @@ def checklist_cmd(
     input_token_budget: int = typer.Option(24000, "--input-token-budget"),
     map_batch_size: int = typer.Option(16, "--map-batch-size"),
     map_max_rendered_children: int = typer.Option(5, "--map-max-rendered-children"),
+    min_match_strength: LinkStrength = typer.Option(LinkStrength.Medium, "--min-match-strength", case_sensitive=False),
+    min_kg_link_strength: LinkStrength = typer.Option(LinkStrength.Medium, "--min-kg-link-strength", case_sensitive=False),
+    max_items: int = typer.Option(100, "--max-items"),
+    max_matches_per_extract: int = typer.Option(5, "--max-matches-per-extract"),
+    max_findings_per_historical: int = typer.Option(3, "--max-findings-per-historical"),
+    max_findings_per_extract: int = typer.Option(12, "--max-findings-per-extract"),
+    dedupe_findings: bool = typer.Option(True, "--dedupe-findings/--no-dedupe-findings"),
     verbose: bool = typer.Option(True, "--verbose/--quiet", help="Show detailed terminal progress logs."),
 ):
     """Export a read-only Markdown audit checklist for a new project."""
@@ -121,7 +128,18 @@ def checklist_cmd(
     if sqlite_path is not None and not sqlite_path.exists():
         raise typer.BadParameter(f"SQLite database does not exist for read-only checklist export: {sqlite_path}", param_hint="--db")
     kg = HistoricalDatabase(db)
-    cfg = LLMConfig(input_token_budget=input_token_budget, map_batch_size=map_batch_size, map_max_rendered_children=map_max_rendered_children)
+    cfg = LLMConfig(
+        input_token_budget=input_token_budget,
+        map_batch_size=map_batch_size,
+        map_max_rendered_children=map_max_rendered_children,
+        min_match_strength=min_match_strength.value,
+        min_kg_link_strength=min_kg_link_strength.value,
+        max_items=max_items,
+        max_matches_per_extract=max_matches_per_extract,
+        max_findings_per_historical=max_findings_per_historical,
+        max_findings_per_extract=max_findings_per_extract,
+        dedupe_findings=dedupe_findings,
+    )
     log = make_logger(verbose)
     spec = ProjectSpec.parse(project)
     project_data = load_project(spec)

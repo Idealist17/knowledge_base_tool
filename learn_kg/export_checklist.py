@@ -25,6 +25,8 @@ class ChecklistFinding:
     exploit_shape: str
     kg_link_strength: str
     kg_evidence: str
+    finding_id: int | None = None
+    canonical_finding_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -43,9 +45,20 @@ class ProjectSemanticChecklist:
 
 
 @dataclass(frozen=True)
+class ChecklistCandidate:
+    extract_index: int
+    match: SemanticMatchDecision
+    finding: ChecklistFinding
+
+
+@dataclass(frozen=True)
 class ChecklistDocument:
     project_name: str
     groups: list[ProjectSemanticChecklist] = field(default_factory=list)
+    candidate_items_considered: int = 0
+    candidate_items_rendered: int = 0
+    candidate_items_deduped: int = 0
+    candidate_items_trimmed: int = 0
 
     @property
     def project_semantics_analyzed(self) -> int:
@@ -113,6 +126,10 @@ def render_checklist_markdown(doc: ChecklistDocument) -> str:
         f"- Project semantics analyzed: {doc.project_semantics_analyzed}",
         f"- Historical semantics matched: {doc.historical_semantics_matched}",
         f"- Checklist items: {doc.checklist_items}",
+        f"- Candidate checklist findings considered: {doc.candidate_items_considered}",
+        f"- Candidate checklist findings rendered: {doc.candidate_items_rendered}",
+        f"- Candidate checklist findings deduped: {doc.candidate_items_deduped}",
+        f"- Candidate checklist findings trimmed by caps: {doc.candidate_items_trimmed}",
     ]
 
     if not doc.groups:
@@ -182,7 +199,12 @@ def fetch_historical_semantic_names(db: HistoricalDatabase, semantic_ids: list[i
     return {int(semantic_id): name for semantic_id, name in rows}
 
 
-def fetch_semantic_findings(db: HistoricalDatabase, semantic_ids: list[int]) -> dict[int, list[ChecklistFinding]]:
+def fetch_semantic_findings(
+    db: HistoricalDatabase,
+    semantic_ids: list[int],
+    *,
+    min_kg_link_strength: LinkStrength | str | None = None,
+) -> dict[int, list[ChecklistFinding]]:
     """Read linked findings for historical semantic ids, including semantics merged into them."""
     ids = _dedupe_ints(semantic_ids)
     out: dict[int, list[ChecklistFinding]] = {semantic_id: [] for semantic_id in ids}
@@ -203,6 +225,7 @@ def fetch_semantic_findings(db: HistoricalDatabase, semantic_ids: list[int]) -> 
                 s.SemanticFindingLink.semantic_node_id,
                 s.SemanticFindingLink.strength,
                 s.SemanticFindingLink.evidence,
+                s.AuditFinding.id,
                 s.AuditFinding.title,
                 s.AuditFinding.severity,
                 s.AuditFinding.root_cause,
@@ -213,22 +236,36 @@ def fetch_semantic_findings(db: HistoricalDatabase, semantic_ids: list[int]) -> 
             .where(s.SemanticFindingLink.semantic_node_id.in_(query_ids))
             .order_by(s.SemanticFindingLink.semantic_node_id, s.AuditFinding.id)
         ).all()
+        canonical_finding_ids = _finding_canonical_ids(session, [row[3] for row in rows])
 
-    for semantic_id, strength, evidence, title, severity, root_cause, patterns, exploits in rows:
+    seen_by_root: dict[int, dict[object, int]] = {semantic_id: {} for semantic_id in ids}
+    for semantic_id, strength, evidence, finding_id, title, severity, root_cause, patterns, exploits in rows:
+        if not _meets_min_strength(strength, min_kg_link_strength):
+            continue
         root_id = root_by_member.get(int(semantic_id))
         if root_id is None:
             continue
-        out[root_id].append(
-            ChecklistFinding(
-                title=title,
-                severity=severity,
-                root_cause=root_cause,
-                risk_pattern=patterns,
-                exploit_shape=exploits,
-                kg_link_strength=strength,
-                kg_evidence=evidence,
-            )
+        finding = ChecklistFinding(
+            title=title,
+            severity=severity,
+            root_cause=root_cause,
+            risk_pattern=patterns,
+            exploit_shape=exploits,
+            kg_link_strength=strength,
+            kg_evidence=evidence,
+            finding_id=int(finding_id) if finding_id is not None else None,
+            canonical_finding_id=canonical_finding_ids.get(int(finding_id)) if finding_id is not None else None,
         )
+        dedupe_key = _finding_dedupe_key(finding)
+        seen = seen_by_root.setdefault(root_id, {})
+        existing_index = seen.get(dedupe_key)
+        if existing_index is None:
+            seen[dedupe_key] = len(out[root_id])
+            out[root_id].append(finding)
+            continue
+        existing = out[root_id][existing_index]
+        if _prefer_finding_link(finding, existing):
+            out[root_id][existing_index] = finding
     return out
 
 
@@ -254,31 +291,201 @@ def _semantic_cluster_ids(db: HistoricalDatabase, root_ids: list[int]) -> dict[i
     return clusters
 
 
-def _is_checklist_strength(strength: object) -> bool:
-    value = strength.value if hasattr(strength, "value") else str(strength)
-    return value in {LinkStrength.High.value, LinkStrength.Medium.value}
+def _finding_canonical_ids(session, finding_ids: list[int]) -> dict[int, int]:
+    """Map each finding id to the root/canonical finding it was merged into."""
+    ids = _dedupe_ints(finding_ids)
+    canonical = {finding_id: finding_id for finding_id in ids}
+    unresolved = set(ids)
+    seen_frontier: set[int] = set()
+    while unresolved:
+        unresolved -= seen_frontier
+        if not unresolved:
+            break
+        seen_frontier.update(unresolved)
+        rows = session.execute(
+            select(s.FindingMerge.from_finding_id, s.FindingMerge.to_finding_id)
+            .where(s.FindingMerge.from_finding_id.in_(sorted(unresolved)))
+        ).all()
+        next_unresolved: set[int] = set()
+        for child_id, parent_id in rows:
+            child_id = int(child_id)
+            parent_id = int(parent_id)
+            for original_id, current_id in list(canonical.items()):
+                if current_id == child_id:
+                    canonical[original_id] = parent_id
+                    next_unresolved.add(parent_id)
+        unresolved = next_unresolved
+    return canonical
 
 
-def _indexes_with_checklist_matches(matches: list[SemanticMatchDecision]) -> set[int]:
-    return {match.extract_index for match in matches if _is_checklist_strength(match.strength)}
+def _strength_value(strength: object) -> str:
+    return str(strength.value if hasattr(strength, "value") else strength)
 
 
-def _dedupe_checklist_matches(matches: list[SemanticMatchDecision]) -> list[SemanticMatchDecision]:
+def _strength_rank(strength: object) -> int:
+    return {LinkStrength.Low.value: 1, LinkStrength.Medium.value: 2, LinkStrength.High.value: 3}.get(_strength_value(strength), 0)
+
+
+def _severity_rank(severity: object) -> int:
+    return {"Low": 1, "Medium": 2, "High": 3}.get(_text(severity), 0)
+
+
+def _evidence_specificity(value: object) -> int:
+    text = _text(value)
+    if not text:
+        return 0
+    words = [part for part in text.replace("/", " ").replace("_", " ").split() if part]
+    return len(set(words)) * 2 + min(len(text), 500)
+
+
+def _meets_min_strength(strength: object, minimum: LinkStrength | str | None) -> bool:
+    if minimum is None:
+        return True
+    return _strength_rank(strength) >= _strength_rank(minimum) > 0
+
+
+def _finding_dedupe_key(finding: ChecklistFinding) -> tuple[str, object]:
+    if finding.canonical_finding_id is not None:
+        return ("id", finding.canonical_finding_id)
+    if finding.finding_id is not None:
+        return ("id", finding.finding_id)
+    return ("text", (_text(finding.title), _text(finding.root_cause)))
+
+
+def _prefer_finding_link(candidate: ChecklistFinding, existing: ChecklistFinding) -> bool:
+    candidate_rank = _strength_rank(candidate.kg_link_strength)
+    existing_rank = _strength_rank(existing.kg_link_strength)
+    if candidate_rank != existing_rank:
+        return candidate_rank > existing_rank
+    return len(_text(candidate.kg_evidence)) > len(_text(existing.kg_evidence))
+
+
+def _indexes_with_checklist_matches(matches: list[SemanticMatchDecision], minimum: LinkStrength | str | None = LinkStrength.Medium) -> set[int]:
+    return {match.extract_index for match in matches if _meets_min_strength(match.strength, minimum)}
+
+
+def _dedupe_checklist_matches(
+    matches: list[SemanticMatchDecision],
+    *,
+    min_match_strength: LinkStrength | str | None = LinkStrength.Medium,
+) -> list[SemanticMatchDecision]:
     by_pair: dict[tuple[int, int], SemanticMatchDecision] = {}
-    rank = {LinkStrength.Low.value: 1, LinkStrength.Medium.value: 2, LinkStrength.High.value: 3}
     for match in matches:
-        if not _is_checklist_strength(match.strength):
+        if not _meets_min_strength(match.strength, min_match_strength):
             continue
         key = (match.extract_index, match.historical_id)
         existing = by_pair.get(key)
         if existing is None:
             by_pair[key] = match
             continue
-        old_rank = rank.get(existing.strength.value if hasattr(existing.strength, "value") else str(existing.strength), 0)
-        new_rank = rank.get(match.strength.value if hasattr(match.strength, "value") else str(match.strength), 0)
+        old_rank = _strength_rank(existing.strength)
+        new_rank = _strength_rank(match.strength)
         if new_rank > old_rank or (new_rank == old_rank and len(match.evidence) > len(existing.evidence)):
             by_pair[key] = match
     return sorted(by_pair.values(), key=lambda item: (item.extract_index, item.historical_id))
+
+
+def _candidate_sort_key(candidate: ChecklistCandidate) -> tuple[int, int, int, int, int, int]:
+    finding_id = candidate.finding.finding_id if candidate.finding.finding_id is not None else -1
+    return (
+        _strength_rank(candidate.match.strength),
+        _strength_rank(candidate.finding.kg_link_strength),
+        _severity_rank(candidate.finding.severity),
+        _evidence_specificity(candidate.finding.kg_evidence),
+        _evidence_specificity(candidate.match.evidence),
+        -finding_id,
+    )
+
+
+def _sort_candidates(candidates: list[ChecklistCandidate]) -> list[ChecklistCandidate]:
+    return sorted(candidates, key=_candidate_sort_key, reverse=True)
+
+
+def _plan_checklist_candidates(
+    matches: list[SemanticMatchDecision],
+    findings_by_semantic: dict[int, list[ChecklistFinding]],
+    *,
+    max_items: int,
+    max_matches_per_extract: int,
+    max_findings_per_historical: int,
+    max_findings_per_extract: int,
+    dedupe_findings: bool,
+) -> tuple[dict[int, dict[int, list[ChecklistFinding]]], int, int, int, int]:
+    """Rank finding candidates globally, apply per-extract/per-historical caps, then global cap."""
+    candidates: list[ChecklistCandidate] = []
+    for match in matches:
+        findings = _sort_findings(findings_by_semantic.get(match.historical_id, []))
+        for finding in findings:
+            candidates.append(ChecklistCandidate(match.extract_index, match, finding))
+
+    considered = len(candidates)
+    sorted_candidates = _sort_candidates(candidates)
+    selected: list[ChecklistCandidate] = []
+    deduped = 0
+    seen_findings: set[tuple[str, object]] = set()
+    matches_by_extract: dict[int, set[int]] = {}
+    findings_by_extract: dict[int, int] = {}
+    findings_by_pair: dict[tuple[int, int], int] = {}
+
+    for candidate in sorted_candidates:
+        if dedupe_findings:
+            dedupe_key = _finding_dedupe_key(candidate.finding)
+            if dedupe_key in seen_findings:
+                deduped += 1
+                continue
+        else:
+            dedupe_key = None
+
+        extract_matches = matches_by_extract.setdefault(candidate.extract_index, set())
+        pair_key = (candidate.extract_index, candidate.match.historical_id)
+        is_new_match_for_extract = candidate.match.historical_id not in extract_matches
+        if max_items >= 0 and len(selected) >= max_items:
+            continue
+        if max_matches_per_extract >= 0 and is_new_match_for_extract and len(extract_matches) >= max_matches_per_extract:
+            continue
+        if max_findings_per_extract >= 0 and findings_by_extract.get(candidate.extract_index, 0) >= max_findings_per_extract:
+            continue
+        if max_findings_per_historical >= 0 and findings_by_pair.get(pair_key, 0) >= max_findings_per_historical:
+            continue
+
+        selected.append(candidate)
+        extract_matches.add(candidate.match.historical_id)
+        findings_by_extract[candidate.extract_index] = findings_by_extract.get(candidate.extract_index, 0) + 1
+        findings_by_pair[pair_key] = findings_by_pair.get(pair_key, 0) + 1
+        if dedupe_key is not None:
+            seen_findings.add(dedupe_key)
+
+    planned: dict[int, dict[int, list[ChecklistFinding]]] = {}
+    for candidate in _sort_candidates(selected):
+        planned.setdefault(candidate.extract_index, {}).setdefault(candidate.match.historical_id, []).append(candidate.finding)
+
+    trimmed = max(0, considered - len(selected) - deduped)
+    return planned, considered, len(selected), deduped, trimmed
+
+
+def _sort_findings(findings: list[ChecklistFinding]) -> list[ChecklistFinding]:
+    return sorted(
+        findings,
+        key=lambda finding: (
+            _strength_rank(finding.kg_link_strength),
+            _severity_rank(finding.severity),
+            _evidence_specificity(finding.kg_evidence),
+            -(finding.finding_id if finding.finding_id is not None else -1),
+        ),
+        reverse=True,
+    )
+
+
+def _sort_matches(matches: list[SemanticMatchDecision]) -> list[SemanticMatchDecision]:
+    return sorted(
+        matches,
+        key=lambda match: (
+            _strength_rank(match.strength),
+            _evidence_specificity(match.evidence),
+            -match.historical_id,
+        ),
+        reverse=True,
+    )
 
 
 async def build_project_checklist(
@@ -287,10 +494,19 @@ async def build_project_checklist(
     project,
     *,
     config: LLMConfig | None = None,
+    min_kg_link_strength: LinkStrength | str | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> ChecklistDocument:
     """Analyze a project and build a read-only historical checklist document."""
     config = config or LLMConfig()
+    min_match_strength = getattr(config, "min_match_strength", LinkStrength.Medium.value)
+    if min_kg_link_strength is None:
+        min_kg_link_strength = getattr(config, "min_kg_link_strength", None)
+    max_items = int(getattr(config, "max_items", 100))
+    max_matches_per_extract = int(getattr(config, "max_matches_per_extract", 5))
+    max_findings_per_historical = int(getattr(config, "max_findings_per_historical", 3))
+    max_findings_per_extract = int(getattr(config, "max_findings_per_extract", 12))
+    dedupe_findings = bool(getattr(config, "dedupe_findings", True))
     _log(logger, f"[cyan]stage[/cyan] categorize project={project.name}")
     categories = await categorize_project(llm, project)
     _log(logger, "[green]done[/green] categorize categories=" + ",".join(c.value if hasattr(c, "value") else str(c) for c in categories))
@@ -312,7 +528,7 @@ async def build_project_checklist(
         logger=logger,
     )
 
-    strong_indexes = _indexes_with_checklist_matches(match_results)
+    strong_indexes = _indexes_with_checklist_matches(match_results, min_match_strength)
     unmatched_indexes = [idx for idx in range(len(semantics)) if idx not in strong_indexes]
     fallback_categories = sorted({cat.value for cat in all_defi_categories()} - set(pass1_categories))
     if unmatched_indexes and fallback_categories:
@@ -328,12 +544,26 @@ async def build_project_checklist(
             logger=logger,
         ))
 
-    checklist_matches = _dedupe_checklist_matches(match_results)
+    checklist_matches = _dedupe_checklist_matches(match_results, min_match_strength=min_match_strength)
     _log(logger, f"[green]done[/green] map semantics matched={len(checklist_matches)}")
 
     matched_ids = _dedupe_ints([match.historical_id for match in checklist_matches])
     names_by_id = fetch_historical_semantic_names(db, matched_ids)
-    findings_by_semantic = fetch_semantic_findings(db, matched_ids)
+    findings_by_semantic = fetch_semantic_findings(db, matched_ids, min_kg_link_strength=min_kg_link_strength)
+    planned_findings, candidate_count, rendered_count, deduped_count, trimmed_count = _plan_checklist_candidates(
+        checklist_matches,
+        findings_by_semantic,
+        max_items=max_items,
+        max_matches_per_extract=max_matches_per_extract,
+        max_findings_per_historical=max_findings_per_historical,
+        max_findings_per_extract=max_findings_per_extract,
+        dedupe_findings=dedupe_findings,
+    )
+    _log(
+        logger,
+        "[green]done[/green] plan checklist "
+        f"candidates={candidate_count} rendered={rendered_count} deduped={deduped_count} trimmed={trimmed_count}",
+    )
 
     matches_by_extract: dict[int, list[SemanticMatchDecision]] = {}
     for match in checklist_matches:
@@ -341,23 +571,39 @@ async def build_project_checklist(
 
     groups: list[ProjectSemanticChecklist] = []
     for idx, semantic in enumerate(semantics):
-        semantic_matches = matches_by_extract.get(idx, [])
+        semantic_matches = _sort_matches(matches_by_extract.get(idx, []))
+        selected_for_extract = planned_findings.get(idx, {})
         if not semantic_matches:
             groups.append(ProjectSemanticChecklist(semantic=semantic, matched_semantics=[]))
             continue
+
+        renderable_matches = [match for match in semantic_matches if selected_for_extract.get(match.historical_id)]
+        if not renderable_matches:
+            # Keep one best empty historical match as a useful manual-review anchor when
+            # matching succeeded but no linked finding survived KG-strength filtering.
+            # Do not render every trimmed/capped empty match, or caps would not bound output.
+            renderable_matches = semantic_matches[:1]
+
         matches = [
             MatchedHistoricalSemantic(
                 semantic_id=match.historical_id,
                 name=names_by_id.get(match.historical_id, f"#{match.historical_id}"),
                 match_strength=match.strength.value if hasattr(match.strength, "value") else str(match.strength),
                 match_evidence=match.evidence,
-                findings=findings_by_semantic.get(match.historical_id, []),
+                findings=selected_for_extract.get(match.historical_id, []),
             )
-            for match in semantic_matches
+            for match in renderable_matches
         ]
         groups.append(ProjectSemanticChecklist(semantic=semantic, matched_semantics=matches))
 
-    return ChecklistDocument(project_name=project.name, groups=groups)
+    return ChecklistDocument(
+        project_name=project.name,
+        groups=groups,
+        candidate_items_considered=candidate_count,
+        candidate_items_rendered=rendered_count,
+        candidate_items_deduped=deduped_count,
+        candidate_items_trimmed=trimmed_count,
+    )
 
 
 async def export_project_checklist(
@@ -367,9 +613,10 @@ async def export_project_checklist(
     out: Path,
     *,
     config: LLMConfig | None = None,
+    min_kg_link_strength: LinkStrength | str | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> ChecklistDocument:
-    doc = await build_project_checklist(db, llm, project, config=config, logger=logger)
+    doc = await build_project_checklist(db, llm, project, config=config, min_kg_link_strength=min_kg_link_strength, logger=logger)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_checklist_markdown(doc), encoding="utf-8")
     return doc

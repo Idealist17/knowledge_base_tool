@@ -20,7 +20,9 @@ from learn_kg.models import (
     ExtractedSemantic,
     FindingMergeDecision,
     FindingMergeResult,
+    GlobalLink,
     InProjectLink,
+    LinkStrength,
     ProjectData,
     SourceFile,
     SemanticFunction,
@@ -65,6 +67,48 @@ def seed_historical_linked_finding(db: HistoricalDatabase, tmp_path: Path) -> No
             [FindingMergeResult(finding=finding(), decision=FindingMergeDecision(new_finding_title="Reentrant withdraw"))],
             [InProjectLink(semantic_index=0, finding_index=0, evidence="same withdraw flow")],
         )
+
+
+def seed_historical_with_findings(
+    db: HistoricalDatabase,
+    tmp_path: Path,
+    *,
+    semantic_names: list[str],
+    finding_titles_by_semantic: list[list[str]],
+    link_strength: LinkStrength = LinkStrength.High,
+) -> None:
+    p = ProjectData(name="hist-many", platform_id="hist-many", root_dir=tmp_path, source_files=[])
+    finding_titles = [title for titles in finding_titles_by_semantic for title in titles]
+    links = []
+    finding_index = 0
+    for semantic_index, titles in enumerate(finding_titles_by_semantic):
+        for title in titles:
+            links.append(InProjectLink(semantic_index=semantic_index, finding_index=finding_index, strength=link_strength, evidence=f"link evidence for {title}"))
+            finding_index += 1
+    with db.Session() as session, session.begin():
+        write_project_completed(
+            session,
+            p,
+            [DeFiCategory.Lending],
+            [
+                SemanticMergeResult(semantic=sem(name), decision=SemanticMergeDecision(new_semantic_name=name))
+                for name in semantic_names
+            ],
+            [
+                FindingMergeResult(finding=finding(title), decision=FindingMergeDecision(new_finding_title=title))
+                for title in finding_titles
+            ],
+            links,
+        )
+
+
+def checklist_project(tmp_path: Path, source_count: int = 1) -> ProjectData:
+    source = "\n".join(f"function withdraw{idx}() external {{}}" for idx in range(source_count))
+    return ProjectData(
+        name="new-proj",
+        root_dir=tmp_path,
+        source_files=[SourceFile(path="Vault.sol", content=f"contract Vault {{ {source} }}", language="solidity")],
+    )
 
 
 def test_summary_dedupes_historical_semantics():
@@ -228,6 +272,166 @@ def test_empty_match_still_outputs_manual_review(tmp_path):
     assert "- [ ] Manually review this semantic; no historical finding links were matched." in md
 
 
+def test_build_project_checklist_min_match_strength_high_filters_medium(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_linked_finding(db, tmp_path)
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [{"extract_index": 0, "historical_id": 1, "strength": "Medium", "evidence": "medium semantic overlap"}],
+        [],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(min_match_strength="High")))
+    md = render_checklist_markdown(doc)
+
+    assert doc.historical_semantics_matched == 0
+    assert doc.candidate_items_considered == 0
+    assert "### Matched historical semantic: None" in md
+    assert "Historical Withdraw" not in md
+    assert "Reentrant withdraw" not in md
+
+
+def test_build_project_checklist_min_kg_link_strength_high_filters_medium_link(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(
+        db,
+        tmp_path,
+        semantic_names=["Historical Withdraw"],
+        finding_titles_by_semantic=[["Medium KG link finding"]],
+        link_strength=LinkStrength.Medium,
+    )
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [{"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "high semantic match"}],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(min_kg_link_strength="High")))
+    md = render_checklist_markdown(doc)
+
+    assert doc.historical_semantics_matched == 1
+    assert doc.candidate_items_considered == 0
+    assert "### Matched historical semantic: Historical Withdraw" in md
+    assert "- [ ] Manually review this semantic; a historical semantic matched, but no linked findings were found." in md
+    assert "Medium KG link finding" not in md
+
+
+def test_build_project_checklist_global_finding_id_dedupes_across_semantics(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(
+        db,
+        tmp_path,
+        semantic_names=["Historical Withdraw A", "Historical Withdraw B"],
+        finding_titles_by_semantic=[["Shared finding"], []],
+    )
+    db.append_semantic_finding_links([GlobalLink(semantic_id=2, finding_id=1, strength=LinkStrength.High, evidence="same finding linked from second semantic")])
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [
+            {"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "first semantic match"},
+            {"extract_index": 0, "historical_id": 2, "strength": "High", "evidence": "second semantic match"},
+        ],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path)))
+    rendered_titles = [
+        finding.title
+        for match in doc.groups[0].matched_semantics
+        for finding in match.findings
+    ]
+
+    assert doc.candidate_items_considered == 2
+    assert doc.candidate_items_rendered == 1
+    assert doc.candidate_items_deduped == 1
+    assert rendered_titles == ["Shared finding"]
+
+
+def test_build_project_checklist_applies_max_items_cap(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(db, tmp_path, semantic_names=["Historical Withdraw"], finding_titles_by_semantic=[["F1", "F2", "F3"]])
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [{"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "match"}],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(max_items=2)))
+
+    assert doc.candidate_items_considered == 3
+    assert doc.candidate_items_rendered == 2
+    assert doc.candidate_items_trimmed == 1
+    assert len(doc.groups[0].matched_semantics[0].findings) == 2
+
+
+def test_build_project_checklist_applies_max_findings_per_historical_cap(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(db, tmp_path, semantic_names=["Historical Withdraw"], finding_titles_by_semantic=[["F1", "F2", "F3"]])
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [{"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "match"}],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(max_findings_per_historical=1)))
+
+    assert doc.candidate_items_considered == 3
+    assert doc.candidate_items_rendered == 1
+    assert doc.candidate_items_trimmed == 2
+    assert len(doc.groups[0].matched_semantics[0].findings) == 1
+
+
+def test_build_project_checklist_applies_max_findings_per_extract_cap(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(
+        db,
+        tmp_path,
+        semantic_names=["Historical Withdraw A", "Historical Withdraw B"],
+        finding_titles_by_semantic=[["A1", "A2"], ["B1", "B2"]],
+    )
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [
+            {"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "match A"},
+            {"extract_index": 0, "historical_id": 2, "strength": "High", "evidence": "match B"},
+        ],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(max_findings_per_historical=10, max_findings_per_extract=2)))
+    rendered_count = sum(len(match.findings) for match in doc.groups[0].matched_semantics)
+
+    assert doc.candidate_items_considered == 4
+    assert doc.candidate_items_rendered == 2
+    assert doc.candidate_items_trimmed == 2
+    assert rendered_count == 2
+
+
 def test_cli_checklist_writes_markdown_and_does_not_mutate_db(tmp_path, monkeypatch):
     db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
     db.init()
@@ -256,6 +460,89 @@ def test_cli_checklist_writes_markdown_and_does_not_mutate_db(tmp_path, monkeypa
     assert out.exists()
     assert "# Audit Checklist: new" in out.read_text(encoding="utf-8")
     assert db.counts() == before
+
+
+def test_cli_checklist_uses_default_export_config(tmp_path, monkeypatch):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    (project_dir / "Vault.sol").write_text("contract Vault { function withdraw() external {} }", encoding="utf-8")
+    out = tmp_path / "checklist.md"
+    captured_config = {}
+
+    async def fake_export(kg, llm, project, out_path, *, config=None, logger=None):
+        captured_config["config"] = config
+        doc = ChecklistDocument(project_name=project.name, groups=[])
+        out_path.write_text(render_checklist_markdown(doc), encoding="utf-8")
+        return doc
+
+    monkeypatch.setattr("learn_kg.cli.export_project_checklist", fake_export)
+
+    result = CliRunner().invoke(app, ["checklist", "--db", f"sqlite:///{tmp_path/'kg.sqlite3'}", "--project", f"new:{project_dir}", "--out", str(out), "--quiet"])
+
+    assert result.exit_code == 0, result.output
+    cfg = captured_config["config"]
+    assert isinstance(cfg, LLMConfig)
+    assert cfg.input_token_budget == 24000
+    assert cfg.map_batch_size == 16
+    assert cfg.map_max_rendered_children == 5
+    assert cfg.min_match_strength == "Medium"
+    assert cfg.min_kg_link_strength == "Medium"
+    assert cfg.max_items == 100
+    assert cfg.max_matches_per_extract == 5
+    assert cfg.max_findings_per_historical == 3
+    assert cfg.max_findings_per_extract == 12
+    assert cfg.dedupe_findings is True
+
+
+def test_cli_checklist_passes_custom_export_config(tmp_path, monkeypatch):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    (project_dir / "Vault.sol").write_text("contract Vault { function withdraw() external {} }", encoding="utf-8")
+    out = tmp_path / "checklist.md"
+    captured_config = {}
+
+    async def fake_export(kg, llm, project, out_path, *, config=None, logger=None):
+        captured_config["config"] = config
+        doc = ChecklistDocument(project_name=project.name, groups=[])
+        out_path.write_text(render_checklist_markdown(doc), encoding="utf-8")
+        return doc
+
+    monkeypatch.setattr("learn_kg.cli.export_project_checklist", fake_export)
+
+    result = CliRunner().invoke(app, [
+        "checklist",
+        "--db", f"sqlite:///{tmp_path/'kg.sqlite3'}",
+        "--project", f"new:{project_dir}",
+        "--out", str(out),
+        "--input-token-budget", "1234",
+        "--map-batch-size", "9",
+        "--map-max-rendered-children", "4",
+        "--min-match-strength", "High",
+        "--min-kg-link-strength", "High",
+        "--max-items", "6",
+        "--max-matches-per-extract", "2",
+        "--max-findings-per-historical", "1",
+        "--max-findings-per-extract", "3",
+        "--no-dedupe-findings",
+        "--quiet",
+    ])
+
+    assert result.exit_code == 0, result.output
+    cfg = captured_config["config"]
+    assert cfg.input_token_budget == 1234
+    assert cfg.map_batch_size == 9
+    assert cfg.map_max_rendered_children == 4
+    assert cfg.min_match_strength == "High"
+    assert cfg.min_kg_link_strength == "High"
+    assert cfg.max_items == 6
+    assert cfg.max_matches_per_extract == 2
+    assert cfg.max_findings_per_historical == 1
+    assert cfg.max_findings_per_extract == 3
+    assert cfg.dedupe_findings is False
 
 
 def test_cli_checklist_rejects_missing_sqlite_without_creating_file(tmp_path):
@@ -429,3 +716,81 @@ def test_build_project_checklist_low_pass1_does_not_render_and_allows_pass2(tmp_
     assert doc.groups[0].matched_semantics[0].semantic_id == 2
     assert doc.groups[0].matched_semantics[0].match_strength == "Medium"
     assert len([prompt for prompt in llm.prompts if "HISTORICAL SEMANTICS CURRENT BATCH" in prompt]) == 2
+
+
+def test_build_project_checklist_dedupes_merged_finding_cluster(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    p = ProjectData(name="hist-merged-findings", platform_id="hist-merged-findings", root_dir=tmp_path, source_files=[])
+    with db.Session() as session, session.begin():
+        write_project_completed(
+            session,
+            p,
+            [DeFiCategory.Lending],
+            [
+                SemanticMergeResult(semantic=sem("Historical Withdraw A"), decision=SemanticMergeDecision(new_semantic_name="Historical Withdraw A")),
+                SemanticMergeResult(semantic=sem("Historical Withdraw B"), decision=SemanticMergeDecision(new_semantic_name="Historical Withdraw B")),
+            ],
+            [
+                FindingMergeResult(finding=finding("Canonical shared finding"), decision=FindingMergeDecision(new_finding_title="Canonical shared finding")),
+                FindingMergeResult(finding=finding("Merged shared finding"), decision=FindingMergeDecision(new_finding_title="Merged shared finding", target_ids=[1])),
+            ],
+            [
+                InProjectLink(semantic_index=0, finding_index=0, strength=LinkStrength.High, evidence="canonical link evidence"),
+                InProjectLink(semantic_index=1, finding_index=1, strength=LinkStrength.High, evidence="merged link evidence"),
+            ],
+        )
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [
+            {"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "first semantic match"},
+            {"extract_index": 0, "historical_id": 2, "strength": "High", "evidence": "second semantic match"},
+        ],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path)))
+    rendered_titles = [
+        finding.title
+        for match in doc.groups[0].matched_semantics
+        for finding in match.findings
+    ]
+
+    assert doc.candidate_items_considered == 2
+    assert doc.candidate_items_rendered == 1
+    assert doc.candidate_items_deduped == 1
+    assert len(rendered_titles) == 1
+
+
+def test_build_project_checklist_applies_max_matches_per_extract_cap(tmp_path):
+    db = HistoricalDatabase(f"sqlite:///{tmp_path/'kg.sqlite3'}")
+    db.init()
+    seed_historical_with_findings(
+        db,
+        tmp_path,
+        semantic_names=["Historical Withdraw A", "Historical Withdraw B", "Historical Withdraw C"],
+        finding_titles_by_semantic=[["A1"], ["B1"], ["C1"]],
+    )
+    llm = MockLLMClient([
+        [{"category": "Lending"}],
+        [
+            {"tool": "report_semantic", "args": sem().model_dump(mode="json")},
+            {"tool": "finish", "args": {"summary": "done"}},
+        ],
+        [
+            {"extract_index": 0, "historical_id": 1, "strength": "High", "evidence": "match A"},
+            {"extract_index": 0, "historical_id": 2, "strength": "High", "evidence": "match B"},
+            {"extract_index": 0, "historical_id": 3, "strength": "High", "evidence": "match C"},
+        ],
+    ])
+
+    doc = __import__("asyncio").run(build_project_checklist(db, llm, checklist_project(tmp_path), config=LLMConfig(max_matches_per_extract=2)))
+
+    assert doc.candidate_items_considered == 3
+    assert doc.candidate_items_rendered == 2
+    assert doc.candidate_items_trimmed == 1
+    assert len(doc.groups[0].matched_semantics) == 2
+    assert sum(len(match.findings) for match in doc.groups[0].matched_semantics) == 2

@@ -12,6 +12,13 @@ Source code + audit material
 
 The project is designed to be easy to run locally, simple to inspect, and structured around a clear data flow.
 
+
+## Bundled knowledge base and backtest example
+
+This repository includes a prebuilt high-severity vulnerability knowledge base at `knowledge_base_db/high_vulns.sqlite3`. The database is built from Code4rena contests from 2021 through 2024, covering roughly 153 projects, and combines extracted protocol semantics with vulnerability findings and their semantic-finding links.
+
+The `examples/` directory contains one project from that training dataset. It is kept in the same C4-style layout accepted by `learnkg learn-c4` and can be used as a backtest fixture to replay extraction, linking, or checklist generation against a known in-sample project.
+
 ## Features
 
 - Load explicit local projects with optional audit reports.
@@ -47,13 +54,23 @@ OPENAI_BASE_URL=https://your-openai-compatible-endpoint.example.com/v1
 
 ## Quick start
 
+Use the bundled historical high-severity database directly:
+
+```bash
+learnkg list-projects --db sqlite:///knowledge_base_db/high_vulns.sqlite3
+learnkg search-semantics --db sqlite:///knowledge_base_db/high_vulns.sqlite3 --keyword liquidation
+learnkg export-html --db sqlite:///knowledge_base_db/high_vulns.sqlite3 --out kg.html
+```
+
+Or initialize a fresh database and learn from a C4-style fixture. The `examples/` fixture is one of the Code4rena projects used in the training set and is intended for backtesting:
+
 ```bash
 learnkg init-db --db sqlite:///kg.sqlite3
 
 learnkg learn-c4 \
   --db sqlite:///kg.sqlite3 \
-  --c4-dir tests/fixtures/c4 \
-  --limit 2 \
+  --c4-dir examples \
+  --c4-ids 3 \
   --link
 
 learnkg list-projects --db sqlite:///kg.sqlite3

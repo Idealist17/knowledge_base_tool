@@ -16,3 +16,10 @@ class LLMConfig:
     map_batch_size: int = 16
     map_max_rendered_children: int = 5
     finding_token_budget: int = 16000
+    min_match_strength: str = "Medium"
+    min_kg_link_strength: str = "Medium"
+    max_items: int = 100
+    max_matches_per_extract: int = 5
+    max_findings_per_historical: int = 3
+    max_findings_per_extract: int = 12
+    dedupe_findings: bool = True
