@@ -112,6 +112,13 @@ class LinkStrength(str, Enum):
     Low = "Low"
 
 
+class SemanticMatchDecision(BaseModel):
+    extract_index: int
+    historical_id: int
+    strength: LinkStrength
+    evidence: str
+
+
 class InProjectLink(BaseModel):
     semantic_index: int
     finding_index: int

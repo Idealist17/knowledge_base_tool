@@ -112,6 +112,8 @@ def checklist_cmd(
     project: str = typer.Option(..., "--project", help="Project spec in name:path[:platform_id] form."),
     out: Path = typer.Option(..., "--out"),
     input_token_budget: int = typer.Option(24000, "--input-token-budget"),
+    map_batch_size: int = typer.Option(16, "--map-batch-size"),
+    map_max_rendered_children: int = typer.Option(5, "--map-max-rendered-children"),
     verbose: bool = typer.Option(True, "--verbose/--quiet", help="Show detailed terminal progress logs."),
 ):
     """Export a read-only Markdown audit checklist for a new project."""
@@ -119,7 +121,7 @@ def checklist_cmd(
     if sqlite_path is not None and not sqlite_path.exists():
         raise typer.BadParameter(f"SQLite database does not exist for read-only checklist export: {sqlite_path}", param_hint="--db")
     kg = HistoricalDatabase(db)
-    cfg = LLMConfig(input_token_budget=input_token_budget)
+    cfg = LLMConfig(input_token_budget=input_token_budget, map_batch_size=map_batch_size, map_max_rendered_children=map_max_rendered_children)
     log = make_logger(verbose)
     spec = ProjectSpec.parse(project)
     project_data = load_project(spec)

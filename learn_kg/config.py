@@ -13,4 +13,6 @@ class LLMConfig:
     max_retries: int = field(default_factory=lambda: int(os.getenv("OPENAI_MAX_RETRIES", "5")))
     input_token_budget: int = 24000
     merge_chunk_candidate_token_budget: int = 12000
+    map_batch_size: int = 16
+    map_max_rendered_children: int = 5
     finding_token_budget: int = 16000

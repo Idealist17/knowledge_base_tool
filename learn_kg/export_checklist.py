@@ -11,9 +11,9 @@ from .config import LLMConfig
 from .db import HistoricalDatabase
 from .extract import categorize_project, extract_semantics
 from .llm_client import LLMClient
-from .merge import merge_semantics
-from .models import ExtractedSemantic
-from .taxonomy import coerce_defi_category
+from .models import ExtractedSemantic, LinkStrength, SemanticMatchDecision
+from .semantic_mapper import map_project_semantics_to_historical
+from .taxonomy import DeFiCategory, all_defi_categories, coerce_defi_category
 
 
 @dataclass(frozen=True)
@@ -254,6 +254,33 @@ def _semantic_cluster_ids(db: HistoricalDatabase, root_ids: list[int]) -> dict[i
     return clusters
 
 
+def _is_checklist_strength(strength: object) -> bool:
+    value = strength.value if hasattr(strength, "value") else str(strength)
+    return value in {LinkStrength.High.value, LinkStrength.Medium.value}
+
+
+def _indexes_with_checklist_matches(matches: list[SemanticMatchDecision]) -> set[int]:
+    return {match.extract_index for match in matches if _is_checklist_strength(match.strength)}
+
+
+def _dedupe_checklist_matches(matches: list[SemanticMatchDecision]) -> list[SemanticMatchDecision]:
+    by_pair: dict[tuple[int, int], SemanticMatchDecision] = {}
+    rank = {LinkStrength.Low.value: 1, LinkStrength.Medium.value: 2, LinkStrength.High.value: 3}
+    for match in matches:
+        if not _is_checklist_strength(match.strength):
+            continue
+        key = (match.extract_index, match.historical_id)
+        existing = by_pair.get(key)
+        if existing is None:
+            by_pair[key] = match
+            continue
+        old_rank = rank.get(existing.strength.value if hasattr(existing.strength, "value") else str(existing.strength), 0)
+        new_rank = rank.get(match.strength.value if hasattr(match.strength, "value") else str(match.strength), 0)
+        if new_rank > old_rank or (new_rank == old_rank and len(match.evidence) > len(existing.evidence)):
+            by_pair[key] = match
+    return sorted(by_pair.values(), key=lambda item: (item.extract_index, item.historical_id))
+
+
 async def build_project_checklist(
     db: HistoricalDatabase,
     llm: LLMClient,
@@ -273,31 +300,62 @@ async def build_project_checklist(
     _log(logger, f"[green]done[/green] extract semantics={len(semantics)}")
 
     semantic_categories = sorted({coerce_defi_category(sem.category).value for sem in semantics})
-    canonicals = db.canonical_semantics_with_children_for_categories(semantic_categories)
-    _log(logger, f"[cyan]stage[/cyan] merge semantics canon_candidates={len(canonicals)}")
-    merge_results = await merge_semantics(llm, semantics, canonicals)
-    _log(logger, f"[green]done[/green] merge semantics matched={sum(1 for r in merge_results if r.decision.target_ids)}")
+    pass1_categories = sorted({*semantic_categories, DeFiCategory.Others.value})
+    pass1_candidates = db.canonical_semantics_with_children_for_categories(pass1_categories)
+    _log(logger, f"[cyan]stage[/cyan] map semantics pass=1 candidates={len(pass1_candidates)} batch_size={config.map_batch_size}")
+    match_results = await map_project_semantics_to_historical(
+        llm,
+        semantics,
+        pass1_candidates,
+        batch_size=config.map_batch_size,
+        max_children=config.map_max_rendered_children,
+        logger=logger,
+    )
 
-    matched_ids = _dedupe_ints([tid for result in merge_results for tid in result.decision.target_ids])
+    strong_indexes = _indexes_with_checklist_matches(match_results)
+    unmatched_indexes = [idx for idx in range(len(semantics)) if idx not in strong_indexes]
+    fallback_categories = sorted({cat.value for cat in all_defi_categories()} - set(pass1_categories))
+    if unmatched_indexes and fallback_categories:
+        pass2_candidates = db.canonical_semantics_with_children_for_categories(fallback_categories)
+        _log(logger, f"[cyan]stage[/cyan] map semantics pass=2 unmatched={len(unmatched_indexes)} candidates={len(pass2_candidates)} batch_size={config.map_batch_size}")
+        match_results.extend(await map_project_semantics_to_historical(
+            llm,
+            semantics,
+            pass2_candidates,
+            batch_size=config.map_batch_size,
+            max_children=config.map_max_rendered_children,
+            extract_indexes=unmatched_indexes,
+            logger=logger,
+        ))
+
+    checklist_matches = _dedupe_checklist_matches(match_results)
+    _log(logger, f"[green]done[/green] map semantics matched={len(checklist_matches)}")
+
+    matched_ids = _dedupe_ints([match.historical_id for match in checklist_matches])
     names_by_id = fetch_historical_semantic_names(db, matched_ids)
     findings_by_semantic = fetch_semantic_findings(db, matched_ids)
 
+    matches_by_extract: dict[int, list[SemanticMatchDecision]] = {}
+    for match in checklist_matches:
+        matches_by_extract.setdefault(match.extract_index, []).append(match)
+
     groups: list[ProjectSemanticChecklist] = []
-    for result in merge_results:
-        if not result.decision.target_ids:
-            groups.append(ProjectSemanticChecklist(semantic=result.semantic, matched_semantics=[]))
+    for idx, semantic in enumerate(semantics):
+        semantic_matches = matches_by_extract.get(idx, [])
+        if not semantic_matches:
+            groups.append(ProjectSemanticChecklist(semantic=semantic, matched_semantics=[]))
             continue
         matches = [
             MatchedHistoricalSemantic(
-                semantic_id=tid,
-                name=names_by_id.get(tid, f"#{tid}"),
-                match_strength="High",
-                match_evidence=result.decision.reason,
-                findings=findings_by_semantic.get(tid, []),
+                semantic_id=match.historical_id,
+                name=names_by_id.get(match.historical_id, f"#{match.historical_id}"),
+                match_strength=match.strength.value if hasattr(match.strength, "value") else str(match.strength),
+                match_evidence=match.evidence,
+                findings=findings_by_semantic.get(match.historical_id, []),
             )
-            for tid in result.decision.target_ids
+            for match in semantic_matches
         ]
-        groups.append(ProjectSemanticChecklist(semantic=result.semantic, matched_semantics=matches))
+        groups.append(ProjectSemanticChecklist(semantic=semantic, matched_semantics=matches))
 
     return ChecklistDocument(project_name=project.name, groups=groups)
 

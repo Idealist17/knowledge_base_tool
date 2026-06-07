@@ -314,3 +314,49 @@ def finding_merge_prompt(new_findings: list[ExtractedFinding], canonicals: list[
 
 def global_link_prompt(findings: list[dict], semantics: list[dict]) -> str:
     return "Link canonical findings to canonical semantics. Omit unrelated pairs. Return exactly one JSON object: {\"items\":[{\"semantic_id\":1,\"finding_id\":1,\"strength\":\"High|Medium|Low\",\"evidence\":\"...\"}]}\nFINDINGS:\n" + json.dumps(findings, indent=2) + "\nSEMANTICS:\n" + json.dumps(semantics, indent=2)
+
+
+def semantic_map_prompt(extracted_semantics: list[dict], historical_batch: list[dict], *, max_children: int = 5) -> str:
+    """Build a read-only checklist matching prompt for one historical semantic batch."""
+    rendered_historicals = []
+    allowed_historical_ids = []
+    for item in historical_batch:
+        historical_id = item.get("id")
+        if historical_id is not None:
+            allowed_historical_ids.append(historical_id)
+        children = list(item.get("children") or [])
+        shown_children = children[:max(0, max_children)]
+        rendered = {
+            "historical_id": historical_id,
+            "category": item.get("category"),
+            "name": item.get("name"),
+            "definition": item.get("definition"),
+            "description": item.get("description"),
+            "merged_raw_examples": [
+                {"name": child.get("name"), "description": child.get("description")}
+                for child in shown_children
+            ],
+        }
+        if len(children) > len(shown_children):
+            rendered["more_not_shown"] = len(children) - len(shown_children)
+        rendered_historicals.append(rendered)
+    allowed_extract_indexes = [
+        item.get("extract_index")
+        for item in extracted_semantics
+        if isinstance(item, dict) and item.get("extract_index") is not None
+    ]
+    return (
+        "Match extracted project semantics to historical knowledge-graph semantics for a read-only audit checklist. "
+        "This is NOT knowledge-base admission or merge: do not update, rename, rewrite, or generalize any canonical. "
+        "Return only related pairs and omit clearly unrelated pairs to keep the response compact. "
+        f"Each returned historical_id MUST be one of the ids in this current batch only: {allowed_historical_ids}. "
+        f"Each extract_index MUST be one of the indexes shown in the extracted block only: {allowed_extract_indexes}. "
+        "strength MUST be exactly one of High, Medium, or Low. "
+        "evidence MUST be a non-empty concise explanation grounded in both sides. "
+        "Return exactly one JSON object: {\"items\":[{\"extract_index\":0,\"historical_id\":123,\"strength\":\"High\",\"evidence\":\"specific shared mechanism...\"}]}\n"
+        "Use High for same business mechanism, Medium for meaningfully related checklist value, and Low for weak/contextual similarity.\n"
+        "EXTRACTED PROJECT SEMANTICS:\n"
+        + json.dumps(extracted_semantics, indent=2, ensure_ascii=False)
+        + "\nHISTORICAL SEMANTICS CURRENT BATCH:\n"
+        + json.dumps(rendered_historicals, indent=2, ensure_ascii=False)
+    )
